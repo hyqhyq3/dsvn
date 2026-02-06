@@ -1,0 +1,45 @@
+[package]
+name = "dsvn-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# Async runtime
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+
+# Compression
+zstd = { workspace = true }
+zstd-safe = { workspace = true }
+
+# Cryptography
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+# Storage
+fjall = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Utilities
+bytes = { workspace = true }
+futures = { workspace = true }
+uuid = { version = "1.10", features = ["v4"] }
+
+# Time
+chrono = { workspace = true }
+
+[dev-dependencies]
+criterion = "0.5"
+proptest = "1.5"
+tempfile = "3.13"

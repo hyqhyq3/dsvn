@@ -1,0 +1,48 @@
+[package]
+name = "dsvn-server"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "dsvn"
+path = "src/main.rs"
+
+[dependencies]
+# Core
+dsvn-core = { path = "../dsvn-core" }
+dsvn-webdav = { path = "../dsvn-webdav" }
+
+# Async
+tokio = { workspace = true }
+
+# HTTP
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+
+# TLS
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+
+# Configuration
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Utilities
+bytes = { workspace = true }
+http-body-util = { workspace = true }
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# TLS
+tokio-rustls = "0.26"
