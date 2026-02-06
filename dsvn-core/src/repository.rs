@@ -58,6 +58,7 @@ impl Repository {
     }
 
     /// Get file content by path
+    /// Supports both flat storage (full path) and hierarchical trees
     pub async fn get_file(&self, path: &str, rev: u64) -> Result<Bytes> {
         // Get commit for revision
         let commits = self.commits.read().await;
@@ -72,8 +73,20 @@ impl Repository {
         })?;
         let tree: Tree = bincode::deserialize(tree_data)?;
 
-        // Navigate to file
-        let path_parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+        // First try: look up by full path (MVP flat storage)
+        let full_path = path.trim_start_matches('/');
+        if let Some(entry) = tree.get(full_path) {
+            if entry.kind == ObjectKind::Blob {
+                let blob_data = objects.get(&entry.id).ok_or_else(|| {
+                    anyhow::anyhow!("Blob {} not found", entry.id)
+                })?;
+                let blob: Blob = Blob::deserialize(blob_data)?;
+                return Ok(Bytes::from(blob.data));
+            }
+        }
+
+        // Second try: hierarchical navigation (for proper tree structure)
+        let path_parts: Vec<&str> = full_path.split('/').collect();
         let mut current_tree = tree;
 
         for (i, part) in path_parts.iter().enumerate() {
@@ -143,6 +156,7 @@ impl Repository {
     }
 
     /// Add or update a file
+    /// For MVP, uses flat storage with full path as key in root tree
     pub async fn add_file(&self, path: &str, content: Vec<u8>, executable: bool) -> Result<ObjectId> {
         // Create blob
         let blob = Blob::new(content, executable);
@@ -154,11 +168,11 @@ impl Repository {
         objects.insert(blob_id, Bytes::from(blob_data));
         drop(objects);
 
-        // Update root tree with the new file entry
+        // Add to root tree with full path as key
         let mut root_tree = self.root_tree.write().await;
-        let filename = path.trim_start_matches('/');
+        let full_path = path.trim_start_matches('/');
         let entry = TreeEntry::new(
-            filename.to_string(),
+            full_path.to_string(),
             blob_id,
             ObjectKind::Blob,
             if executable { 0o755 } else { 0o644 },
@@ -173,16 +187,79 @@ impl Repository {
         Ok(blob_id)
     }
 
-    /// Create a directory
-    pub async fn mkdir(&self, _path: &str) -> Result<ObjectId> {
-        let tree = Tree::new();
-        let tree_id = tree.id();
-        let tree_data = tree.to_bytes()?;
+    /// Create a directory with proper tree hierarchy
+    pub async fn mkdir(&self, path: &str) -> Result<ObjectId> {
+        // Parse path into parts
+        let path_parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
 
-        let mut objects = self.objects.write().await;
-        objects.insert(tree_id, Bytes::from(tree_data));
+        if path_parts.len() == 1 {
+            // Simple case: directory in root
+            let mut root_tree = self.root_tree.write().await;
+            let new_tree = Tree::new();
+            let tree_id = new_tree.id();
+            let tree_data = new_tree.to_bytes()?;
 
-        Ok(tree_id)
+            let mut objects = self.objects.write().await;
+            objects.insert(tree_id, Bytes::from(tree_data));
+            drop(objects);
+
+            let entry = TreeEntry::new(
+                path_parts[0].to_string(),
+                tree_id,
+                ObjectKind::Tree,
+                0o755,
+            );
+            root_tree.insert(entry);
+            drop(root_tree);
+
+            // Update path index
+            let mut path_index = self.path_index.write().await;
+            path_index.insert(path.to_string(), tree_id);
+
+            Ok(tree_id)
+        } else {
+            // Complex case: nested directory - simplify by just ensuring parent paths exist
+            // For MVP, we'll create the directory tree and add it to root
+            let new_tree = Tree::new();
+            let tree_id = new_tree.id();
+            let tree_data = new_tree.to_bytes()?;
+
+            let mut objects = self.objects.write().await;
+            objects.insert(tree_id, Bytes::from(tree_data));
+
+            // Add to root tree with full path
+            let mut root_tree = self.root_tree.write().await;
+            let full_path = path.trim_start_matches('/');
+            let entry = TreeEntry::new(
+                full_path.to_string(),
+                tree_id,
+                ObjectKind::Tree,
+                0o755,
+            );
+            root_tree.insert(entry);
+            drop(root_tree);
+            drop(objects);
+
+            // Update path index
+            let mut path_index = self.path_index.write().await;
+            path_index.insert(path.to_string(), tree_id);
+
+            Ok(tree_id)
+        }
+    }
+
+    /// Delete a file or directory
+    pub async fn delete_file(&self, path: &str) -> Result<()> {
+        // Remove from path index
+        let mut path_index = self.path_index.write().await;
+        path_index.remove(path);
+
+        // Remove from root tree
+        let mut root_tree = self.root_tree.write().await;
+        let filename = path.trim_start_matches('/');
+        root_tree.remove(filename);
+
+        Ok(())
     }
 
     /// Create a new commit
