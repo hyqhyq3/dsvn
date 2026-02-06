@@ -94,14 +94,14 @@ impl PersistentRepository {
             self.load_from_disk().await?;
             return Ok(());
         }
-        
+
         let tree = Tree::new();
         let tree_id = tree.id();
         let tree_data = tree.to_bytes()?;
-        
+
         // Store in memory
         self.objects.write().await.insert(tree_id, tree_data);
-        
+
         // Create initial commit
         let commit = Commit::new(
             tree_id,
@@ -111,16 +111,18 @@ impl PersistentRepository {
             chrono::Utc::now().timestamp(),
             0,
         );
-        
+
         self.commits.write().await.insert(0, commit);
-        
-        // Update metadata
-        let mut meta = self.metadata.write().await;
-        meta.current_rev = 0;
-        
-        // Save to disk
+
+        // Update metadata and release lock before save_to_disk
+        {
+            let mut meta = self.metadata.write().await;
+            meta.current_rev = 0;
+        } // Lock released here
+
+        // Save to disk (without holding metadata lock)
         self.save_to_disk().await?;
-        
+
         Ok(())
     }
     
@@ -182,9 +184,9 @@ impl PersistentRepository {
         let tree = Tree::new();
         let tree_id = tree.id();
         let tree_data = tree.to_bytes()?;
-        
+
         self.objects.write().await.insert(tree_id, tree_data);
-        
+
         let current_rev = self.current_rev().await;
         let parents = if current_rev > 0 {
             let commits = self.commits.read().await;
@@ -192,7 +194,7 @@ impl PersistentRepository {
         } else {
             vec![]
         };
-        
+
         let commit = Commit::new(
             tree_id,
             parents,
@@ -201,17 +203,19 @@ impl PersistentRepository {
             timestamp,
             0,
         );
-        
+
         let new_rev = current_rev + 1;
         self.commits.write().await.insert(new_rev, commit);
-        
-        // Update metadata
-        let mut meta = self.metadata.write().await;
-        meta.current_rev = new_rev;
-        
-        // Save to disk
+
+        // Update metadata and release lock before save_to_disk
+        {
+            let mut meta = self.metadata.write().await;
+            meta.current_rev = new_rev;
+        } // Lock released here
+
+        // Save to disk (without holding metadata lock)
         self.save_to_disk().await?;
-        
+
         Ok(new_rev)
     }
     
@@ -238,68 +242,108 @@ impl PersistentRepository {
     
     /// Save to disk
     async fn save_to_disk(&self) -> Result<()> {
-        // Save metadata
+        // Clone data to avoid holding locks during I/O
         let metadata_path = self.path.join("metadata.json");
-        let meta = self.metadata.read().await;
-        let file = File::create(&metadata_path)?;
-        let mut writer = BufWriter::new(file);
-        serde_json::to_writer_pretty(&mut writer, &*meta)?;
-        writer.flush()?;
-        
-        // Save commits
         let commits_path = self.path.join("commits.json");
-        let commits = self.commits.read().await;
-        let commits_map: HashMap<u64, &Commit> = commits.iter().map(|(k, v)| (*k, v)).collect();
-        let file = File::create(&commits_path)?;
-        let mut writer = BufWriter::new(file);
-        serde_json::to_writer_pretty(&mut writer, &commits_map)?;
-        writer.flush()?;
-        
-        // Save objects
         let objects_path = self.path.join("objects.json");
-        let objects = self.objects.read().await;
-        let objects_map: HashMap<String, &[u8]> = objects.iter()
-            .map(|(k, v)| (k.to_hex(), v.as_slice()))
-            .collect();
-        let file = File::create(&objects_path)?;
-        let mut writer = BufWriter::new(file);
-        serde_json::to_writer_pretty(&mut writer, &objects_map)?;
-        writer.flush()?;
-        
-        Ok(())
+
+        let meta = {
+            let meta_lock = self.metadata.read().await;
+            meta_lock.clone()
+        };
+
+        let commits_map = {
+            let commits_lock = self.commits.read().await;
+            commits_lock.iter().map(|(k, v)| (*k, v.clone())).collect::<HashMap<u64, Commit>>()
+        };
+
+        let objects_map = {
+            let objects_lock = self.objects.read().await;
+            objects_lock.iter()
+                .map(|(k, v)| (k.to_hex(), v.clone()))
+                .collect::<HashMap<String, Vec<u8>>>()
+        };
+
+        // Perform I/O operations outside of locks using spawn_blocking
+        tokio::task::spawn_blocking(move || {
+            // Save metadata
+            let file = File::create(&metadata_path)?;
+            let mut writer = BufWriter::new(file);
+            serde_json::to_writer_pretty(&mut writer, &meta)?;
+            writer.flush()?;
+
+            // Save commits
+            let file = File::create(&commits_path)?;
+            let mut writer = BufWriter::new(file);
+            serde_json::to_writer_pretty(&mut writer, &commits_map)?;
+            writer.flush()?;
+
+            // Save objects
+            let file = File::create(&objects_path)?;
+            let mut writer = BufWriter::new(file);
+            serde_json::to_writer_pretty(&mut writer, &objects_map)?;
+            writer.flush()?;
+
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .map_err(|e| anyhow!("Join error: {}", e))?
     }
     
     /// Load from disk
     async fn load_from_disk(&self) -> Result<()> {
-        // Load commits
         let commits_path = self.path.join("commits.json");
-        if commits_path.exists() {
-            let file = File::open(&commits_path)?;
-            let reader = BufReader::new(file);
-            let commits_map: HashMap<u64, Commit> = serde_json::from_reader(reader)?;
-            
+        let objects_path = self.path.join("objects.json");
+
+        // Load data in spawn_blocking to avoid blocking async runtime
+        let (commits_map, objects_map) = tokio::task::spawn_blocking(move || {
+            // Load commits
+            let commits_map: HashMap<u64, Commit> = if commits_path.exists() {
+                let file = File::open(&commits_path)?;
+                let reader = BufReader::new(file);
+                serde_json::from_reader(reader)?
+            } else {
+                HashMap::new()
+            };
+
+            // Load objects
+            let mut objects_map: HashMap<String, Vec<u8>> = if objects_path.exists() {
+                let file = File::open(&objects_path)?;
+                let reader = BufReader::new(file);
+                serde_json::from_reader(reader)?
+            } else {
+                HashMap::new()
+            };
+
+            // Convert hex strings to ObjectIds
+            let mut result = HashMap::new();
+            for (id_hex, data) in objects_map {
+                let id = ObjectId::from_hex(&id_hex)?;
+                result.insert(id, data);
+            }
+
+            Ok::<(HashMap<u64, Commit>, HashMap<ObjectId, Vec<u8>>), anyhow::Error>((commits_map, result))
+        })
+        .await
+        .map_err(|e| anyhow!("Join error: {}", e))??;
+
+        // Update in-memory maps outside of spawn_blocking
+        if !commits_map.is_empty() {
             let mut commits = self.commits.write().await;
             commits.clear();
             for (rev, commit) in commits_map {
                 commits.insert(rev, commit);
             }
         }
-        
-        // Load objects
-        let objects_path = self.path.join("objects.json");
-        if objects_path.exists() {
-            let file = File::open(&objects_path)?;
-            let reader = BufReader::new(file);
-            let objects_map: HashMap<String, Vec<u8>> = serde_json::from_reader(reader)?;
-            
+
+        if !objects_map.is_empty() {
             let mut objects = self.objects.write().await;
             objects.clear();
-            for (id_hex, data) in objects_map {
-                let id = ObjectId::from_hex(&id_hex)?;
+            for (id, data) in objects_map {
                 objects.insert(id, data);
             }
         }
-        
+
         Ok(())
     }
 }
