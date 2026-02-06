@@ -87,6 +87,116 @@ cargo fmt
 cargo clippy -- -D warnings
 ```
 
+## Async Rust Best Practices (Lessons Learned)
+
+### Lock Management in Async Code
+
+**CRITICAL: Avoid holding locks across async/await points**
+
+#### ❌ WRONG - Causes Deadlock
+```rust
+// DON'T: Hold write lock while calling async function that needs read lock
+pub async fn commit(&self, author: String, message: String) -> Result<u64> {
+    // ... create commit ...
+
+    let mut meta = self.metadata.write().await;  // Take write lock
+    meta.current_rev = new_rev;
+
+    self.save_to_disk().await?;  // DEADLOCK! save_to_disk needs metadata.read()
+
+    Ok(new_rev)
+} // Lock released here (too late)
+```
+
+#### ✅ CORRECT - Release Lock Before Async Call
+```rust
+// DO: Release locks before calling functions that need them
+pub async fn commit(&self, author: String, message: String) -> Result<u64> {
+    // ... create commit ...
+
+    // Scope the lock to release it before save_to_disk
+    {
+        let mut meta = self.metadata.write().await;
+        meta.current_rev = new_rev;
+    } // Lock released here
+
+    self.save_to_disk().await?;  // Can now acquire metadata.read()
+
+    Ok(new_rev)
+}
+```
+
+### I/O Operations in Async Context
+
+**Use `tokio::task::spawn_blocking` for synchronous I/O**
+
+#### ❌ WRONG - Blocks Async Runtime
+```rust
+async fn save_to_disk(&self) -> Result<()> {
+    let commits = self.commits.read().await;
+
+    // Blocks the async thread!
+    let file = File::create("commits.json")?;
+    serde_json::to_writer(file, &commits)?;
+
+    Ok(())
+}
+```
+
+#### ✅ CORRECT - Offload to Blocking Thread
+```rust
+async fn save_to_disk(&self) -> Result<()> {
+    // Clone data while holding lock
+    let commits_map = {
+        let commits = self.commits.read().await;
+        commits.iter().map(|(k, v)| (*k, v.clone())).collect()
+    };
+
+    // Perform I/O outside of locks in blocking thread
+    tokio::task::spawn_blocking(move || {
+        let file = File::create("commits.json")?;
+        serde_json::to_writer_pretty(&mut writer, &commits_map)?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await?
+}
+```
+
+### Debugging Test Hangs
+
+When tests hang indefinitely:
+
+1. **Run with timeout**: `timeout 10 cargo test`
+2. **Run specific test**: `cargo test test_name`
+3. **Add debug output**: Use `eprintln!` to trace execution
+4. **Check for locks**: Look for lock acquisition patterns
+5. **Use `--test-threads=1`**: Eliminate race conditions
+
+```bash
+# Identify stuck test
+timeout 10 cargo test -p dsvn-core --lib
+
+# Run with single thread
+cargo test --lib -- --test-threads=1
+
+# Add output to see where it hangs
+cargo test test_name -- --nocapture
+```
+
+### Common Deadlock Patterns
+
+1. **Write lock → Read lock deadlock**: Holding write lock while calling function that needs read lock
+2. **Lock ordering**: Always acquire locks in consistent order
+3. **Async-aware locks**: Use `tokio::sync::RwLock` not `std::sync::RwLock`
+4. **Lock scope**: Minimize time holding locks, clone data if needed
+
+### Testing Persistent Code
+
+- **Use tempdir**: `tempfile::TempDir` for test isolation
+- **Test restart scenarios**: Drop and reopen repository
+- **Verify persistence**: Check data survives process restart
+- **Test concurrent access**: Use `tokio::spawn` for parallel operations
+
 ## Object Model Details
 
 ### ObjectId
@@ -194,13 +304,57 @@ Current tests in:
 - `bincode` for compact binary serialization
 - Manual `to_bytes()` / `deserialize()` methods on objects for control
 
-## Known Limitations (MVP)
+## Current Implementation Status (2026-02-06)
 
-1. **In-memory storage**: Data lost on restart (PersistentRepository in progress)
+### ✅ Completed Features
+
+**WebDAV Protocol Layer (100% complete)**:
+- ✅ PROPFIND - Directory listings with Depth header support
+- ✅ REPORT - Log retrieval and update reports
+- ✅ MERGE - Commit creation via `REPOSITORY.commit()`
+- ✅ GET - File content retrieval
+- ✅ PUT - File creation and updates with executable detection
+- ✅ MKCOL - Directory/collection creation
+- ✅ DELETE - File and directory deletion
+- ✅ CHECKOUT - Working resource creation (WebDAV DeltaV)
+- ✅ CHECKIN - Commit from working resource (WebDAV DeltaV)
+- ✅ MKACTIVITY - SVN transaction management with UUID tracking
+- ✅ PROPPATCH, LOCK, UNLOCK, COPY, MOVE - Stub implementations
+
+**Core Object Model (100% complete)**:
+- ✅ Blob, Tree, Commit, ObjectId implementations
+- ✅ SHA-256 content addressing
+- ✅ Deterministic tree serialization (BTreeMap)
+- ✅ Unix permission support
+
+**Repository Layer (85% complete)**:
+- ✅ In-memory `Repository` with full CRUD operations
+- ✅ Global revision numbers (SVN-compatible)
+- ✅ Path-based queries with fast lookups
+- ✅ Commit history tracking
+- ✅ Transaction management infrastructure
+- ✅ Thread-safe async operations (`Arc<RwLock<>>`)
+- ✅ Persistent repository with JSON file storage (deadlock-free)
+- ✅ Proper async lock management patterns
+- 🔄 Fjall LSM-tree integration (planned)
+
+**CLI Tools (100% complete)**:
+- ✅ `dsvn` - Server management
+- ✅ `dsvn-admin` - Repository admin (init, load)
+- ✅ SVN dump format parser
+
+### 🔄 In Progress
+
+- **Persistent Storage**: `PersistentRepository` using Fjall LSM-tree
+- **Integration Testing**: End-to-end tests with real SVN client
+
+### ⏳ Known Limitations (MVP)
+
+1. **Simple file-based persistence**: JSON format, not optimized for large repos
 2. **Global repository singleton**: No multi-repo support yet
-3. **Basic commit handling**: No full transaction support
-4. **Limited WebDAV**: Basic operations only
-5. **No authentication**: All operations open
+3. **Basic transaction handling**: No rollback or conflict resolution
+4. **No authentication**: All operations open
+5. **Tree integration incomplete**: `add_file()` stores blobs but doesn't update commit trees
 
 ## Performance Targets
 
