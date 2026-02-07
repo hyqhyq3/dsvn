@@ -527,8 +527,10 @@ pub async fn merge_handler(req: Request<Incoming>, _config: &Config) -> Result<R
     let author = if txn.author.is_empty() { "anonymous".to_string() } else { txn.author.clone() };
     let message = if txn.log_message.is_empty() { "No log message".to_string() } else { txn.log_message.clone() };
     let now = chrono::Utc::now();
+    tracing::debug!("Calling repo.commit() with author: {}, message: {}", author, message);
     let new_rev = repo.commit(author.clone(), message, now.timestamp()).await
         .map_err(|e| WebDavError::Internal(e.to_string()))?;
+    tracing::debug!("Commit succeeded, new revision: {}", new_rev);
 
     // Release the commit lock (implicit drop at end of scope)
     drop(_commit_guard);

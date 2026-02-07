@@ -399,7 +399,9 @@ impl SqliteRepository {
                 .unwrap_or_else(|| timestamp.to_string());
 
             // Run pre-commit hook (can reject the commit)
+            tracing::debug!("Running pre-commit hook for revision {}", nr);
             hook_mgr.run_pre_commit(nr, &author, &message, &date, &files)?;
+            tracing::debug!("Pre-commit hook passed for revision {}", nr);
 
             let delta = DeltaTree::new(parent_rev, changes, total_entries);
 
@@ -488,7 +490,9 @@ impl SqliteRepository {
         let date = chrono::DateTime::from_timestamp(timestamp, 0)
             .map(|dt| dt.to_rfc3339())
             .unwrap_or_else(|| timestamp.to_string());
+        tracing::debug!("Running pre-commit hook (sync) for revision {}", nr);
         hook_mgr.run_pre_commit(nr, &author, &message, &date, &files)?;
+        tracing::debug!("Pre-commit hook (sync) passed for revision {}", nr);
 
         let delta = DeltaTree::new(parent_rev, changes, total_entries);
 

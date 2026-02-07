@@ -37,9 +37,15 @@ impl HookManager {
     /// Check whether a named hook exists and is executable.
     fn hook_exists(&self, name: &str) -> Option<PathBuf> {
         let p = self.hook_path(name);
-        if p.exists() {
+        tracing::debug!("Checking hook '{}' at path: {:?}", name, p);
+        tracing::debug!("hooks_dir: {:?}", self.hooks_dir);
+        tracing::debug!("Path exists? {}", p.exists());
+        tracing::debug!("Path is file? {}", p.is_file());
+        if p.exists() && p.is_file() {
+            tracing::debug!("Hook '{}' exists and is a file", name);
             Some(p)
         } else {
+            tracing::debug!("Hook '{}' does not exist or is not a file", name);
             None
         }
     }
@@ -48,11 +54,18 @@ impl HookManager {
     /// Returns `Ok(())` if the hook does not exist or exits 0.
     /// Returns an error with the hook's output if it exits non-zero.
     fn run_hook(&self, name: &str, stdin_data: &str) -> Result<()> {
+        tracing::debug!("run_hook called for '{}'", name);
         let hook_path = match self.hook_exists(name) {
             Some(p) => p,
-            None => return Ok(()), // No hook installed — allow
+            None => {
+                tracing::debug!("No hook '{}' installed, allowing operation", name);
+                return Ok(()); // No hook installed — allow
+            }
         };
 
+        tracing::debug!("Executing hook '{}' at {:?}", name, hook_path);
+        tracing::debug!("Hook stdin data:\n{}", stdin_data);
+        
         let mut child = Command::new(&hook_path)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
