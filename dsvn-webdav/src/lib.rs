@@ -6,7 +6,7 @@ pub mod handlers;
 pub mod proppatch;
 pub mod xml;
 
-pub use handlers::{report_handler, propfind_handler, options_handler};
+pub use handlers::{report_handler, propfind_handler, options_handler, init_repository, init_repository_async};
 
 use hyper::{body::Incoming, Request, Response};
 use http_body_util::{BodyExt, Full};

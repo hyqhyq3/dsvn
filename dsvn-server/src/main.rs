@@ -76,7 +76,15 @@ async fn main() -> Result<()> {
 
             info!("Starting DSvn server on {}", addr);
             info!("Repository root: {}", repo_root);
-            info!("Initializing in-memory repository (MVP mode)");
+            info!("Initializing disk-persistent repository");
+
+            // Initialize the disk repository
+            let repo_path = std::path::Path::new(&repo_root);
+            dsvn_webdav::init_repository(repo_path)
+                .expect("Failed to open disk repository");
+            dsvn_webdav::init_repository_async().await
+                .expect("Failed to initialize disk repository");
+            info!("Disk repository initialized at {}", repo_root);
 
             // Create WebDAV handler
             let config = Config {

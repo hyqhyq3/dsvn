@@ -2,11 +2,12 @@
 
 use super::{Config, WebDavError};
 use bytes::Bytes;
-use dsvn_core::{Repository, properties::PropertyStore};
+use dsvn_core::{DiskRepository, DiskPropertyStore};
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Incoming, Request, Response};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
 
 #[derive(Debug, Clone)]
@@ -17,30 +18,43 @@ struct Transaction {
     pub log_message: String,
     pub created_at: i64,
     pub staged_files: HashMap<String, Vec<u8>>,
-    /// path -> (prop_name -> prop_value) for properties set during commit
     pub staged_properties: HashMap<String, HashMap<String, String>>,
 }
 
+static DISK_REPO: OnceLock<Arc<DiskRepository>> = OnceLock::new();
+
 lazy_static::lazy_static! {
-    static ref REPOSITORY: Arc<Repository> = {
-        let repo = Repository::new();
-        let rt = tokio::runtime::Handle::try_current();
-        if let Ok(handle) = rt {
-            tokio::task::block_in_place(|| {
-                handle.block_on(repo.initialize())
-            }).expect("Failed to initialize repository");
-        }
-        Arc::new(repo)
-    };
     static ref TRANSACTIONS: Arc<RwLock<HashMap<String, Transaction>>> = {
         Arc::new(RwLock::new(HashMap::new()))
-    };
-    static ref PROPERTY_STORE: Arc<PropertyStore> = {
-        Arc::new(PropertyStore::new())
     };
     static ref TXN_COUNTER: Arc<std::sync::atomic::AtomicU64> = {
         Arc::new(std::sync::atomic::AtomicU64::new(0))
     };
+}
+
+/// Initialize the global disk repository. Must be called once at server startup.
+pub fn init_repository(repo_root: &Path) -> Result<(), String> {
+    let repo = DiskRepository::open(repo_root)
+        .map_err(|e| format!("Failed to open repository at {:?}: {}", repo_root, e))?;
+    DISK_REPO
+        .set(Arc::new(repo))
+        .map_err(|_| "Repository already initialized".to_string())?;
+    Ok(())
+}
+
+/// Initialize the repository asynchronously (creates initial commit if needed)
+pub async fn init_repository_async() -> Result<(), String> {
+    let repo = get_repo();
+    repo.initialize()
+        .await
+        .map_err(|e| format!("Failed to initialize repository: {}", e))?;
+    Ok(())
+}
+
+fn get_repo() -> &'static Arc<DiskRepository> {
+    DISK_REPO
+        .get()
+        .expect("Repository not initialized — call init_repository() first")
 }
 
 const REPO_PREFIX: &str = "/svn";
@@ -77,19 +91,15 @@ fn find_all_between(s: &str, start_tag: &str, end_tag: &str) -> Vec<String> {
     results
 }
 
-/// Convert namespace-prefixed tag to SVN property name.
-/// C:mykey -> mykey (custom property)
-/// S:executable -> svn:executable  
-/// V:something -> something (dav property)
 fn convert_ns_tag_to_prop_name(ns_tag: &str) -> String {
     if let Some(pos) = ns_tag.find(':') {
         let prefix = &ns_tag[..pos];
         let local = &ns_tag[pos + 1..];
         match prefix {
             "S" | "ns1" => format!("svn:{}", local),
-            "C" | "ns2" => local.to_string(),     // custom properties: just local name
-            "V" | "ns3" => local.to_string(),       // dav properties
-            "D" | "ns0" => local.to_string(),       // DAV core
+            "C" | "ns2" => local.to_string(),
+            "V" | "ns3" => local.to_string(),
+            "D" | "ns0" => local.to_string(),
             _ => local.to_string(),
         }
     } else {
@@ -169,12 +179,13 @@ fn decode_svndiff(data: &[u8]) -> Vec<u8> {
 // ==================== OPTIONS ====================
 
 pub async fn options_handler(req: Request<Incoming>, _config: &Config) -> Result<Response<Full<Bytes>>, WebDavError> {
+    let repo = get_repo();
     let body = req.into_body().collect().await.ok();
     let body_bytes = body.map(|b| b.to_bytes()).unwrap_or_default();
     let body_str = String::from_utf8_lossy(&body_bytes);
     let has_body = body_str.contains("activity-collection-set");
-    let current_rev = REPOSITORY.current_rev().await;
-    let uuid = REPOSITORY.uuid().to_string();
+    let current_rev = repo.current_rev().await;
+    let uuid = repo.uuid().to_string();
     let response_body = if has_body {
         format!("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:options-response xmlns:D=\"DAV:\">\n<D:activity-collection-set><D:href>{}/!svn/act/</D:href></D:activity-collection-set></D:options-response>", REPO_PREFIX)
     } else { String::new() };
@@ -218,6 +229,7 @@ pub async fn options_handler(req: Request<Incoming>, _config: &Config) -> Result
 // ==================== POST (create-txn) ====================
 
 pub async fn post_handler(req: Request<Incoming>, _config: &Config) -> Result<Response<Full<Bytes>>, WebDavError> {
+    let repo = get_repo();
     let path = req.uri().path().to_string();
     let body = match req.into_body().collect().await {
         Ok(c) => c.to_bytes(),
@@ -226,7 +238,7 @@ pub async fn post_handler(req: Request<Incoming>, _config: &Config) -> Result<Re
     let body_str = String::from_utf8_lossy(&body);
     tracing::info!("POST {} body: {}", path, body_str);
     if path.ends_with("/!svn/me") && body_str.contains("create-txn") {
-        let current_rev = REPOSITORY.current_rev().await;
+        let current_rev = repo.current_rev().await;
         let txn_seq = TXN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let txn_name = format!("{}-{}", current_rev, txn_seq);
         let txn = Transaction {
@@ -249,10 +261,11 @@ pub async fn post_handler(req: Request<Incoming>, _config: &Config) -> Result<Re
 // ==================== PROPFIND ====================
 
 pub async fn propfind_handler(req: Request<Incoming>, _config: &Config) -> Result<Response<Full<Bytes>>, WebDavError> {
+    let repo = get_repo();
     let path = req.uri().path().to_string();
     let _ = req.into_body().collect().await;
-    let current_rev = REPOSITORY.current_rev().await;
-    let uuid = REPOSITORY.uuid().to_string();
+    let current_rev = repo.current_rev().await;
+    let uuid = repo.uuid().to_string();
     if path.contains("!svn/") {
         return handle_svn_special_propfind(&path, current_rev, &uuid).await;
     }
@@ -390,6 +403,7 @@ async fn handle_svn_special_propfind(path: &str, current_rev: u64, uuid: &str) -
 // ==================== REPORT ====================
 
 pub async fn report_handler(req: Request<Incoming>, _config: &Config) -> Result<Response<Full<Bytes>>, WebDavError> {
+    let repo = get_repo();
     let body = match req.into_body().collect().await {
         Ok(c) => c.to_bytes(),
         Err(e) => return Ok(Response::builder().status(400).body(Full::new(Bytes::from(format!("Failed: {}", e)))).unwrap()),
@@ -397,8 +411,8 @@ pub async fn report_handler(req: Request<Incoming>, _config: &Config) -> Result<
     let body_str = String::from_utf8_lossy(&body);
     tracing::info!("REPORT body: {}", body_str);
     let xml = if body_str.contains("update-report") || body_str.contains("<S:update") {
-        let current_rev = REPOSITORY.current_rev().await;
-        let uuid = REPOSITORY.uuid();
+        let current_rev = repo.current_rev().await;
+        let uuid = repo.uuid();
         let now = chrono::Utc::now();
         let target_rev = extract_text_between(&body_str, "<S:target-revision>", "</S:target-revision>")
             .and_then(|s| s.parse::<u64>().ok()).unwrap_or(current_rev);
@@ -416,8 +430,8 @@ pub async fn report_handler(req: Request<Incoming>, _config: &Config) -> Result<
             prefix=REPO_PREFIX, rev=target_rev,
             date=now.format("%Y-%m-%dT%H:%M:%S.000000Z"), uuid=uuid)
     } else if body_str.contains("log") {
-        let current_rev = REPOSITORY.current_rev().await;
-        let commits = REPOSITORY.log(current_rev, 100).await.unwrap_or_default();
+        let current_rev = repo.current_rev().await;
+        let commits = repo.log(current_rev, 100).await.unwrap_or_default();
         let mut s = String::from(r#"<?xml version="1.0" encoding="utf-8"?><S:log-report xmlns:S="svn:" xmlns:D="DAV:">"#);
         for (i, c) in commits.iter().enumerate() {
             let rev = current_rev - i as u64;
@@ -442,6 +456,7 @@ pub async fn report_handler(req: Request<Incoming>, _config: &Config) -> Result<
 // ==================== MERGE ====================
 
 pub async fn merge_handler(req: Request<Incoming>, _config: &Config) -> Result<Response<Full<Bytes>>, WebDavError> {
+    let repo = get_repo();
     let body = match req.into_body().collect().await {
         Ok(c) => c.to_bytes(),
         Err(e) => return Ok(Response::builder().status(400).body(Full::new(Bytes::from(format!("Failed: {}", e)))).unwrap()),
@@ -458,23 +473,22 @@ pub async fn merge_handler(req: Request<Incoming>, _config: &Config) -> Result<R
     for (file_path, content) in &txn.staged_files {
         let executable = file_path.ends_with(".sh") || file_path.contains("/bin/");
         tracing::info!("MERGE: adding file {} ({} bytes)", file_path, content.len());
-        REPOSITORY.add_file(file_path, content.clone(), executable).await
+        repo.add_file(file_path, content.clone(), executable).await
             .map_err(|e| WebDavError::Internal(format!("Failed to add file {}: {}", file_path, e)))?;
     }
-    // Apply staged properties
+    let prop_store = repo.property_store();
     for (file_path, props) in &txn.staged_properties {
         for (prop_name, prop_value) in props {
             tracing::info!("MERGE: setting property {}={} on {}", prop_name, prop_value, file_path);
-            // Normalize path: /foo.txt -> /svn/foo.txt for property store
             let store_path = format!("{}{}", REPO_PREFIX, file_path);
-            PROPERTY_STORE.set(store_path, prop_name.clone(), prop_value.clone()).await
+            prop_store.set(store_path, prop_name.clone(), prop_value.clone()).await
                 .map_err(|e| WebDavError::Internal(format!("Failed to set property {} on {}: {}", prop_name, file_path, e)))?;
         }
     }
     let author = if txn.author.is_empty() { "anonymous".to_string() } else { txn.author.clone() };
     let message = if txn.log_message.is_empty() { "No log message".to_string() } else { txn.log_message.clone() };
     let now = chrono::Utc::now();
-    let new_rev = REPOSITORY.commit(author.clone(), message, now.timestamp()).await
+    let new_rev = repo.commit(author.clone(), message, now.timestamp()).await
         .map_err(|e| WebDavError::Internal(e.to_string()))?;
     tracing::info!("Committed revision {}", new_rev);
     let xml = format!(r#"<?xml version="1.0" encoding="utf-8"?>
@@ -505,6 +519,7 @@ pub async fn merge_handler(req: Request<Incoming>, _config: &Config) -> Result<R
 // ==================== GET ====================
 
 pub async fn get_handler(req: Request<Incoming>, _config: &Config) -> Result<Response<Full<Bytes>>, WebDavError> {
+    let repo = get_repo();
     let path = req.uri().path();
     if path.contains("!svn") {
         return Ok(Response::builder().status(404).body(Full::new(Bytes::from("Not found"))).unwrap());
@@ -512,7 +527,7 @@ pub async fn get_handler(req: Request<Incoming>, _config: &Config) -> Result<Res
     if path.ends_with('/') || path == "/svn" {
         return Ok(Response::builder().status(405).header("Allow", "PROPFIND").body(Full::new(Bytes::from("Use PROPFIND"))).unwrap());
     }
-    match REPOSITORY.get_file(path, REPOSITORY.current_rev().await).await {
+    match repo.get_file(path, repo.current_rev().await).await {
         Ok(content) => Ok(Response::builder().status(200).header("Content-Type", "application/octet-stream").body(Full::new(content)).unwrap()),
         Err(_) => Ok(Response::builder().status(404).body(Full::new(Bytes::from("Not found"))).unwrap()),
     }
@@ -521,6 +536,7 @@ pub async fn get_handler(req: Request<Incoming>, _config: &Config) -> Result<Res
 // ==================== PROPPATCH ====================
 
 pub async fn proppatch_handler(req: Request<Incoming>, _config: &Config) -> Result<Response<Full<Bytes>>, WebDavError> {
+    let repo = get_repo();
     let path = req.uri().path().to_string();
     let body = match req.collect().await {
         Ok(c) => c.to_bytes(),
@@ -529,14 +545,10 @@ pub async fn proppatch_handler(req: Request<Incoming>, _config: &Config) -> Resu
     let body_str = String::from_utf8_lossy(&body);
     tracing::info!("PROPPATCH {} body: {}", path, body_str);
     let special = path.strip_prefix(REPO_PREFIX).unwrap_or(&path);
-    // Handle PROPPATCH on transaction root files (!svn/txr/<txn>/<path>)
     if special.starts_with("/!svn/txr/") {
-        // This is a property change on a file within a transaction
-        // Extract txn name and file path
         let rest = special.strip_prefix("/!svn/txr/").unwrap_or("");
         let (txn_name, _file_path) = rest.split_once('/').unwrap_or((rest, ""));
         tracing::info!("PROPPATCH for txr file: txn={}, file={}", txn_name, _file_path);
-        // For now, acknowledge the property change (store in transaction if needed)
         let xml = format!(r#"<?xml version="1.0" encoding="utf-8"?>
 <D:multistatus xmlns:D="DAV:" xmlns:ns3="http://subversion.tigris.org/xmlns/dav/" xmlns:ns2="http://subversion.tigris.org/xmlns/custom/" xmlns:ns1="http://subversion.tigris.org/xmlns/svn/" xmlns:ns0="DAV:">
 <D:response>
@@ -554,7 +566,6 @@ pub async fn proppatch_handler(req: Request<Incoming>, _config: &Config) -> Resu
     if special.starts_with("/!svn/txn/") {
         let txn_name = special.strip_prefix("/!svn/txn/").unwrap_or("").to_string();
         tracing::info!("PROPPATCH for txn: {}", txn_name);
-        // Extract log message from body: <S:log>...</S:log>
         if let Some(log_msg) = extract_text_between(&body_str, "<S:log>", "</S:log>") {
             let mut txns = TRANSACTIONS.write().await;
             if let Some(txn) = txns.get_mut(&txn_name) {
@@ -562,7 +573,6 @@ pub async fn proppatch_handler(req: Request<Incoming>, _config: &Config) -> Resu
                 tracing::info!("Set log message for txn {}: {}", txn_name, log_msg);
             }
         }
-        // Return success multistatus matching official server
         let xml = format!(r#"<?xml version="1.0" encoding="utf-8"?>
 <D:multistatus xmlns:D="DAV:" xmlns:ns3="http://subversion.tigris.org/xmlns/dav/" xmlns:ns2="http://subversion.tigris.org/xmlns/custom/" xmlns:ns1="http://subversion.tigris.org/xmlns/svn/" xmlns:ns0="DAV:">
 <D:response>
@@ -582,6 +592,7 @@ pub async fn proppatch_handler(req: Request<Incoming>, _config: &Config) -> Resu
 
     // Fallback to generic proppatch
     use crate::proppatch::{PropPatchRequest, PropPatchResponse};
+    let prop_store = repo.property_store();
     let proppatch_req = match PropPatchRequest::from_xml(&body_str) {
         Ok(r) => r,
         Err(e) => {
@@ -592,13 +603,13 @@ pub async fn proppatch_handler(req: Request<Incoming>, _config: &Config) -> Resu
     for modification in &proppatch_req.modifications {
         match modification {
             crate::proppatch::PropertyModification::Set { name, value, .. } => {
-                if let Err(e) = PROPERTY_STORE.set(path.clone(), name.clone(), value.clone()).await {
+                if let Err(e) = prop_store.set(path.clone(), name.clone(), value.clone()).await {
                     let response = PropPatchResponse::error(path.clone(), format!("Failed: {}", e));
                     return Ok(Response::builder().status(207).header("Content-Type", "text/xml; charset=utf-8").body(Full::new(Bytes::from(response.to_xml()))).unwrap());
                 }
             }
             crate::proppatch::PropertyModification::Remove { name, .. } => {
-                if let Err(e) = PROPERTY_STORE.remove(&path, name).await {
+                if let Err(e) = prop_store.remove(&path, name).await {
                     let response = PropPatchResponse::error(path.clone(), format!("Failed: {}", e));
                     return Ok(Response::builder().status(207).header("Content-Type", "text/xml; charset=utf-8").body(Full::new(Bytes::from(response.to_xml()))).unwrap());
                 }
@@ -618,20 +629,16 @@ pub async fn put_handler(req: Request<Incoming>, _config: &Config) -> Result<Res
         Err(e) => return Ok(Response::builder().status(400).body(Full::new(Bytes::from(format!("Failed: {}", e)))).unwrap()),
     };
     tracing::info!("PUT {} ({} bytes)", path, body.len());
-    // Check if this is a transaction PUT: /!svn/txr/<txn>/<path>
     let special = path.strip_prefix(REPO_PREFIX).unwrap_or(&path);
     if special.starts_with("/!svn/txr/") {
         let rest = special.strip_prefix("/!svn/txr/").unwrap_or("");
-        // Parse txn name and file path
         if let Some(slash_pos) = rest.find('/') {
             let txn_name = &rest[..slash_pos];
             let file_path = &rest[slash_pos + 1..];
             let full_path = format!("/{}", file_path);
             tracing::info!("Transaction PUT: txn={}, path={}", txn_name, full_path);
-            // Decode svndiff content
             let content = decode_svndiff(&body);
             tracing::info!("Decoded content: {} bytes", content.len());
-            // Store in transaction
             let mut txns = TRANSACTIONS.write().await;
             if let Some(txn) = txns.get_mut(txn_name) {
                 txn.staged_files.insert(full_path.clone(), content);
@@ -640,28 +647,24 @@ pub async fn put_handler(req: Request<Incoming>, _config: &Config) -> Result<Res
                 tracing::error!("Transaction not found: {}", txn_name);
                 return Ok(Response::builder().status(404).body(Full::new(Bytes::from("Transaction not found"))).unwrap());
             }
-            // Return 201 Created with Location header
             return Ok(Response::builder().status(201)
                 .header("Location", format!("{}/!svn/txr/{}/{}", REPO_PREFIX, txn_name, file_path))
                 .body(Full::new(Bytes::new())).unwrap());
         }
     }
-    // Regular PUT (not implemented for MVP)
     Ok(Response::builder().status(405).body(Full::new(Bytes::from("PUT not allowed"))).unwrap())
 }
 
 // ==================== HEAD ====================
 
 pub async fn head_handler(req: Request<Incoming>, _config: &Config) -> Result<Response<Full<Bytes>>, WebDavError> {
+    let repo = get_repo();
     let path = req.uri().path();
     tracing::info!("HEAD {}", path);
-    // For HEAD requests during commit, we need to return 404 for non-existent files
-    // The SVN client checks if file exists before PUT
     if path.contains("!svn") {
         return Ok(Response::builder().status(404).body(Full::new(Bytes::new())).unwrap());
     }
-    // Check if file exists in repository
-    let exists = REPOSITORY.exists(path, REPOSITORY.current_rev().await).await.unwrap_or(false);
+    let exists = repo.exists(path, repo.current_rev().await).await.unwrap_or(false);
     if exists {
         Ok(Response::builder().status(200)
             .header("Content-Type", "application/octet-stream")
