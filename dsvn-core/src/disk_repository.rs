@@ -1,18 +1,52 @@
 //! Disk-persistent repository implementation
 //!
 //! Stores objects on disk using content-addressed filesystem (like git objects).
-//! Only lightweight metadata is held in memory; file content lives on disk.
+//! The working tree (file path → entry mapping) is stored in a sled embedded
+//! database for O(log n) inserts/lookups instead of O(n) HashMap serialization.
 //! Designed to handle 10GB data / 100,000 commits without OOM.
 
 use crate::object::{Blob, Commit, ObjectId, ObjectKind, Tree, TreeEntry};
 use crate::properties::PropertySet;
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// Compact record stored as sled value for each tree entry.
+/// This is the on-disk format; we convert to/from TreeEntry for the public API.
+#[derive(Serialize, Deserialize)]
+struct TreeEntryRecord {
+    object_id: ObjectId,
+    kind: ObjectKind,
+    mode: u32,
+}
+
+impl TreeEntryRecord {
+    fn from_tree_entry(entry: &TreeEntry) -> Self {
+        Self {
+            object_id: entry.id,
+            kind: entry.kind,
+            mode: entry.mode,
+        }
+    }
+
+    fn to_tree_entry(&self, name: String) -> TreeEntry {
+        TreeEntry::new(name, self.object_id, self.kind, self.mode)
+    }
+
+    fn serialize(&self) -> Result<Vec<u8>> {
+        bincode::serialize(self).map_err(|e| anyhow!("Failed to serialize TreeEntryRecord: {}", e))
+    }
+
+    fn deserialize(data: &[u8]) -> Result<Self> {
+        bincode::deserialize(data)
+            .map_err(|e| anyhow!("Failed to deserialize TreeEntryRecord: {}", e))
+    }
+}
 
 /// Disk-persistent repository
 ///
@@ -25,16 +59,18 @@ use tokio::sync::RwLock;
 ///   commits/{rev}.bin       — commit objects (bincode)
 ///   trees/{rev}.bin         — tree snapshots per revision (bincode)
 ///   props/{sha256(path)}.json — property sets keyed by path hash
-///   root_tree.bin           — current working tree (staged, pre-commit)
+///   tree.db/                — sled database for current working tree
 /// ```
 pub struct DiskRepository {
     root: PathBuf,
     uuid: String,
     current_rev: Arc<RwLock<u64>>,
-    /// The in-progress (staged) root tree — kept in memory since it's small metadata
-    root_tree: Arc<RwLock<Tree>>,
+    /// The in-progress (staged) root tree — stored in sled for O(log n) operations
+    tree_db: sled::Db,
     /// Property store (in-memory, persisted on commit)
     property_store: Arc<DiskPropertyStore>,
+    /// Batch mode flag: when true, skip per-operation flush
+    batch_mode: std::sync::atomic::AtomicBool,
 }
 
 /// Disk-backed property store
@@ -158,14 +194,28 @@ impl DiskRepository {
             0
         };
 
-        // Load working root tree (if exists)
+        // Open sled database for the working tree
+        let tree_db = sled::open(root.join("tree.db"))
+            .with_context(|| format!("Failed to open sled database at {:?}", root.join("tree.db")))?;
+
+        // Migration: if old root_tree.bin exists and sled is empty, migrate data
         let root_tree_path = root.join("root_tree.bin");
-        let root_tree = if root_tree_path.exists() {
-            let data = fs::read(&root_tree_path)?;
-            bincode::deserialize(&data).unwrap_or_else(|_| Tree::new())
-        } else {
-            Tree::new()
-        };
+        if root_tree_path.exists() && tree_db.is_empty() {
+            if let Ok(data) = fs::read(&root_tree_path) {
+                if let Ok(old_tree) = bincode::deserialize::<Tree>(&data) {
+                    for entry in old_tree.iter() {
+                        let record = TreeEntryRecord::from_tree_entry(entry);
+                        if let Ok(serialized) = record.serialize() {
+                            let _ = tree_db.insert(entry.name.as_bytes(), serialized);
+                        }
+                    }
+                    let _ = tree_db.flush();
+                    // Remove old file after successful migration
+                    let _ = fs::remove_file(&root_tree_path);
+                    tracing::info!("Migrated root_tree.bin to sled database ({} entries)", old_tree.entries.len());
+                }
+            }
+        }
 
         let property_store = Arc::new(DiskPropertyStore::new(root.clone()));
 
@@ -173,8 +223,9 @@ impl DiskRepository {
             root,
             uuid,
             current_rev: Arc::new(RwLock::new(current_rev)),
-            root_tree: Arc::new(RwLock::new(root_tree)),
+            tree_db,
             property_store,
+            batch_mode: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -191,6 +242,59 @@ impl DiskRepository {
     /// Get the property store
     pub fn property_store(&self) -> &Arc<DiskPropertyStore> {
         &self.property_store
+    }
+
+    // ==================== Sled Tree Helpers ====================
+
+    /// Insert an entry into the sled tree database
+    fn tree_insert(&self, path: &str, entry: &TreeEntryRecord) -> Result<()> {
+        let serialized = entry.serialize()?;
+        self.tree_db
+            .insert(path.as_bytes(), serialized)
+            .with_context(|| format!("Failed to insert tree entry: {}", path))?;
+        Ok(())
+    }
+
+    /// Get an entry from the sled tree database
+    fn tree_get(&self, path: &str) -> Result<Option<TreeEntry>> {
+        match self.tree_db.get(path.as_bytes())? {
+            Some(value) => {
+                let record = TreeEntryRecord::deserialize(&value)?;
+                Ok(Some(record.to_tree_entry(path.to_string())))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Remove an entry from the sled tree database
+    fn tree_remove(&self, path: &str) -> Result<()> {
+        self.tree_db.remove(path.as_bytes())?;
+        Ok(())
+    }
+
+    /// Build a full Tree object from sled (needed for commit snapshots and tree hashing)
+    fn build_tree_from_sled(&self) -> Result<Tree> {
+        let mut tree = Tree::new();
+        for item in self.tree_db.iter() {
+            let (key, value) = item.map_err(|e| anyhow!("sled iteration error: {}", e))?;
+            let path = String::from_utf8(key.to_vec())
+                .map_err(|e| anyhow!("Invalid UTF-8 in tree key: {}", e))?;
+            let record = TreeEntryRecord::deserialize(&value)?;
+            tree.insert(record.to_tree_entry(path));
+        }
+        Ok(tree)
+    }
+
+    /// Populate sled from a Tree object (used when loading tree snapshots)
+    fn populate_sled_from_tree(&self, tree: &Tree) -> Result<()> {
+        // Clear existing entries
+        self.tree_db.clear()?;
+        // Insert all entries from the tree
+        for entry in tree.iter() {
+            let record = TreeEntryRecord::from_tree_entry(entry);
+            self.tree_insert(&entry.name, &record)?;
+        }
+        Ok(())
     }
 
     // ==================== Object Store ====================
@@ -268,13 +372,6 @@ impl DiskRepository {
         Ok(())
     }
 
-    fn save_root_tree(&self, tree: &Tree) -> Result<()> {
-        let path = self.root.join("root_tree.bin");
-        let data = bincode::serialize(tree)?;
-        fs::write(&path, &data)?;
-        Ok(())
-    }
-
     // ==================== Public API (matching in-memory Repository) ====================
 
     /// Initialize the repository with an empty root commit (revision 0)
@@ -290,10 +387,11 @@ impl DiskRepository {
             let mut cr = self.current_rev.write().await;
             *cr = rev;
 
-            // Load root tree from latest revision
-            if let Ok(tree) = self.load_tree_snapshot(rev) {
-                let mut rt = self.root_tree.write().await;
-                *rt = tree;
+            // Load root tree from latest revision into sled (if sled is empty)
+            if self.tree_db.is_empty() {
+                if let Ok(tree) = self.load_tree_snapshot(rev) {
+                    self.populate_sled_from_tree(&tree)?;
+                }
             }
             return Ok(());
         }
@@ -319,7 +417,9 @@ impl DiskRepository {
         self.store_commit(0, &commit)?;
         self.store_tree_snapshot(0, &tree)?;
         self.save_head(0)?;
-        self.save_root_tree(&tree)?;
+
+        // sled is already empty, which represents an empty tree
+        self.tree_db.clear()?;
 
         Ok(())
     }
@@ -400,19 +500,14 @@ impl DiskRepository {
         let blob_data = blob.to_bytes()?;
         self.store_object(&blob_id, &blob_data)?;
 
-        // Update in-memory working tree
-        let mut root_tree = self.root_tree.write().await;
+        // Update sled working tree — O(log n)
         let full_path = path.trim_start_matches('/');
-        let entry = TreeEntry::new(
-            full_path.to_string(),
-            blob_id,
-            ObjectKind::Blob,
-            if executable { 0o755 } else { 0o644 },
-        );
-        root_tree.insert(entry);
-
-        // Persist working tree
-        self.save_root_tree(&root_tree)?;
+        let record = TreeEntryRecord {
+            object_id: blob_id,
+            kind: ObjectKind::Blob,
+            mode: if executable { 0o755 } else { 0o644 },
+        };
+        self.tree_insert(full_path, &record)?;
 
         Ok(blob_id)
     }
@@ -424,26 +519,21 @@ impl DiskRepository {
         let tree_data = new_tree.to_bytes()?;
         self.store_object(&tree_id, &tree_data)?;
 
-        let mut root_tree = self.root_tree.write().await;
         let full_path = path.trim_start_matches('/');
-        let entry = TreeEntry::new(
-            full_path.to_string(),
-            tree_id,
-            ObjectKind::Tree,
-            0o755,
-        );
-        root_tree.insert(entry);
-        self.save_root_tree(&root_tree)?;
+        let record = TreeEntryRecord {
+            object_id: tree_id,
+            kind: ObjectKind::Tree,
+            mode: 0o755,
+        };
+        self.tree_insert(full_path, &record)?;
 
         Ok(tree_id)
     }
 
     /// Delete a file from the working tree
     pub async fn delete_file(&self, path: &str) -> Result<()> {
-        let mut root_tree = self.root_tree.write().await;
         let filename = path.trim_start_matches('/');
-        root_tree.remove(filename);
-        self.save_root_tree(&root_tree)?;
+        self.tree_remove(filename)?;
         Ok(())
     }
 
@@ -454,8 +544,8 @@ impl DiskRepository {
         message: String,
         timestamp: i64,
     ) -> Result<u64> {
-        // Serialize and store the root tree as an object
-        let root_tree = self.root_tree.read().await;
+        // Build Tree from sled and serialize
+        let root_tree = self.build_tree_from_sled()?;
         let tree_id = root_tree.id();
         let tree_data = root_tree.to_bytes()?;
         self.store_object(&tree_id, &tree_data)?;
@@ -488,6 +578,125 @@ impl DiskRepository {
 
         // Update in-memory rev
         let mut cr = self.current_rev.write().await;
+        *cr = new_rev;
+
+        Ok(new_rev)
+    }
+
+    // ==================== Batch Import API ====================
+    //
+    // Synchronous methods optimized for high-throughput bulk import.
+    // These use sled's O(log n) insert directly. In batch mode, sled flush
+    // is deferred to end_batch() for maximum throughput.
+
+    /// Enter batch mode: suppress per-operation sled flush.
+    /// Must call end_batch() when done to ensure persistence.
+    pub fn begin_batch(&self) {
+        self.batch_mode.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Exit batch mode: flush sled to ensure all data is persisted.
+    pub fn end_batch(&self) {
+        self.batch_mode.store(false, std::sync::atomic::Ordering::Relaxed);
+        // Flush sled to disk
+        let _ = self.tree_db.flush();
+    }
+
+    /// Synchronous add_file for batch import.
+    /// O(log n) insert into sled — no full-tree serialization needed.
+    pub fn add_file_sync(
+        &self,
+        path: &str,
+        content: Vec<u8>,
+        executable: bool,
+    ) -> Result<ObjectId> {
+        let blob = Blob::new(content, executable);
+        let blob_id = blob.id();
+        let blob_data = blob.to_bytes()?;
+        self.store_object(&blob_id, &blob_data)?;
+
+        // Update sled working tree — O(log n)
+        let full_path = path.trim_start_matches('/');
+        let record = TreeEntryRecord {
+            object_id: blob_id,
+            kind: ObjectKind::Blob,
+            mode: if executable { 0o755 } else { 0o644 },
+        };
+        self.tree_insert(full_path, &record)?;
+
+        Ok(blob_id)
+    }
+
+    /// Synchronous mkdir for batch import.
+    pub fn mkdir_sync(&self, path: &str) -> Result<ObjectId> {
+        let new_tree = Tree::new();
+        let tree_id = new_tree.id();
+        let tree_data = new_tree.to_bytes()?;
+        self.store_object(&tree_id, &tree_data)?;
+
+        let full_path = path.trim_start_matches('/');
+        let record = TreeEntryRecord {
+            object_id: tree_id,
+            kind: ObjectKind::Tree,
+            mode: 0o755,
+        };
+        self.tree_insert(full_path, &record)?;
+
+        Ok(tree_id)
+    }
+
+    /// Synchronous delete_file for batch import.
+    pub fn delete_file_sync(&self, path: &str) -> Result<()> {
+        let filename = path.trim_start_matches('/');
+        self.tree_remove(filename)?;
+        Ok(())
+    }
+
+    /// Synchronous commit for batch import.
+    /// This is the main commit path optimized for import.
+    /// Builds Tree from sled only when needed for the commit snapshot.
+    pub fn commit_sync(
+        &self,
+        author: String,
+        message: String,
+        timestamp: i64,
+    ) -> Result<u64> {
+        // Build Tree from sled for the commit snapshot
+        let root_tree = self.build_tree_from_sled()?;
+        let tree_id = root_tree.id();
+        let tree_data = root_tree.to_bytes()?;
+        self.store_object(&tree_id, &tree_data)?;
+
+        let current_rev = *self.current_rev.blocking_read();
+
+        let parents = if current_rev > 0 || self.commit_path(current_rev).exists() {
+            if let Ok(parent) = self.load_commit(current_rev) {
+                vec![parent.id()]
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        };
+
+        let commit = Commit::new(tree_id, parents, author, message, timestamp, 0);
+        let commit_id = commit.id();
+        let commit_data = commit.to_bytes()?;
+
+        let new_rev = current_rev + 1;
+
+        self.store_object(&commit_id, &commit_data)?;
+        self.store_commit(new_rev, &commit)?;
+        self.store_tree_snapshot(new_rev, &root_tree)?;
+        self.save_head(new_rev)?;
+
+        // Flush sled if not in batch mode
+        if !self.batch_mode.load(std::sync::atomic::Ordering::Relaxed) {
+            self.tree_db.flush()
+                .map_err(|e| anyhow!("sled flush failed: {}", e))?;
+        }
+
+        let mut cr = self.current_rev.blocking_write();
         *cr = new_rev;
 
         Ok(new_rev)
@@ -642,5 +851,86 @@ mod tests {
         let ps2 = repo2.property_store();
         let props2 = ps2.get("/test.txt").await;
         assert_eq!(props2.get("svn:mime-type"), Some(&"text/plain".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_disk_repo_batch_sync() {
+        let tmp = TempDir::new().unwrap();
+        let repo = DiskRepository::open(tmp.path()).unwrap();
+        repo.initialize().await.unwrap();
+
+        repo.begin_batch();
+        for i in 0..100 {
+            repo.add_file_sync(
+                &format!("file_{}.txt", i),
+                format!("content {}", i).into_bytes(),
+                false,
+            )
+            .unwrap();
+        }
+        let rev = repo.commit_sync("bot".into(), "batch commit".into(), 1000).unwrap();
+        repo.end_batch();
+
+        assert_eq!(rev, 1);
+
+        // Verify file content via committed tree
+        let content = repo.get_file("/file_0.txt", 1).await.unwrap();
+        assert_eq!(content.as_ref(), b"content 0");
+    }
+
+    #[tokio::test]
+    async fn test_disk_repo_delete_file() {
+        let tmp = TempDir::new().unwrap();
+        let repo = DiskRepository::open(tmp.path()).unwrap();
+        repo.initialize().await.unwrap();
+
+        repo.add_file("/to_delete.txt", b"data".to_vec(), false)
+            .await
+            .unwrap();
+        repo.commit("user".into(), "add".into(), 100).await.unwrap();
+
+        repo.delete_file("/to_delete.txt").await.unwrap();
+        repo.commit("user".into(), "delete".into(), 200).await.unwrap();
+
+        // File should exist at rev 1, not at rev 2
+        assert!(repo.get_file("/to_delete.txt", 1).await.is_ok());
+        assert!(repo.get_file("/to_delete.txt", 2).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_disk_repo_migration_from_root_tree_bin() {
+        let tmp = TempDir::new().unwrap();
+
+        // Create repo with old format (simulate by writing root_tree.bin)
+        {
+            let repo = DiskRepository::open(tmp.path()).unwrap();
+            repo.initialize().await.unwrap();
+            repo.add_file("/migrated.txt", b"old data".to_vec(), false)
+                .await
+                .unwrap();
+            repo.commit("user".into(), "pre-migration".into(), 100)
+                .await
+                .unwrap();
+
+            // Write a root_tree.bin manually to simulate old format
+            let tree = repo.build_tree_from_sled().unwrap();
+            let data = bincode::serialize(&tree).unwrap();
+            fs::write(tmp.path().join("root_tree.bin"), &data).unwrap();
+
+            // Remove tree.db to simulate clean state
+            drop(repo);
+            let _ = fs::remove_dir_all(tmp.path().join("tree.db"));
+        }
+
+        // Reopen — should migrate from root_tree.bin
+        {
+            let repo = DiskRepository::open(tmp.path()).unwrap();
+            // Check that sled has the migrated entry
+            let entry = repo.tree_get("migrated.txt").unwrap();
+            assert!(entry.is_some());
+            assert_eq!(entry.unwrap().kind, ObjectKind::Blob);
+            // root_tree.bin should be removed after migration
+            assert!(!tmp.path().join("root_tree.bin").exists());
+        }
     }
 }

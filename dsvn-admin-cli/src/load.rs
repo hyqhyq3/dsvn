@@ -1,144 +1,152 @@
 //! Load SVN dump file into DSvn repository
+//!
+//! Optimized for high-throughput import of large SVN dump files.
+//! Key optimizations:
+//! - Streaming parser: processes entries as they are parsed, no full in-memory load
+//! - Batched disk writes: defers root_tree persistence until commit time
+//! - Progress reporting: only prints every N revisions to reduce IO
+//! - Efficient object storage: minimizes redundant serialization
 
 use crate::dump_format::{NodeAction, NodeKind};
 use anyhow::Result;
 use dsvn_core::DiskRepository;
 use std::io::BufRead;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::task;
 
-/// Load SVN dump file into repository.
+/// Load SVN dump file into repository using streaming parser.
 ///
-/// The dump entries are ordered: revision entry, then its node entries, then
-/// the next revision entry, etc. We collect nodes under each revision and
-/// commit them together.
-pub async fn load_dump_file<R: BufRead>(
+/// Runs the entire import in a blocking thread pool to avoid
+/// blocking the async runtime with synchronous disk operations.
+pub async fn load_dump_file<R: BufRead + Send + 'static>(
+    repo: Arc<DiskRepository>,
+    reader: R,
+) -> Result<()> {
+    task::spawn_blocking(move || {
+        load_dump_file_blocking(&repo, reader)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("Import task failed: {:?}", e))?
+}
+
+/// Blocking version of load_dump_file (runs in spawn_blocking context).
+fn load_dump_file_blocking<R: BufRead>(
     repo: &DiskRepository,
     reader: R,
 ) -> Result<()> {
-    let dump = crate::dump::parse_dump_file(reader)?;
+    let start_time = Instant::now();
+    let total_revisions = AtomicU64::new(0);
+    let total_nodes = AtomicU64::new(0);
+    let final_rev = AtomicU64::new(0);
+    let mut last_report = Instant::now();
 
-    println!("Loading dump file...");
-    println!("Format version: {}", dump.format_version);
-    println!("UUID: {}", dump.uuid);
-    println!("Entries: {}", dump.entries.len());
+    // Use the streaming parser — callback is invoked per revision
+    crate::dump::parse_dump_streaming(reader, |revision| {
+        let rev_num = revision.revision_number;
 
-    if dump.entries.is_empty() {
-        return Ok(());
-    }
+        if rev_num == 0 {
+            return Ok(());
+        }
 
-    // Group entries into (revision_entry, [node_entries])
-    struct RevisionGroup {
-        revision_number: u64,
-        author: String,
-        message: String,
-        timestamp: i64,
-        has_nodes: bool,
-    }
+        let node_count = revision.nodes.len();
 
-    let mut current_group: Option<RevisionGroup> = None;
-    let mut final_rev: u64 = 0;
+        if node_count == 0 {
+            return Ok(());
+        }
 
-    for entry in &dump.entries {
-        if entry.is_revision() {
-            // Commit the previous group if it had nodes and was not rev 0
-            if let Some(group) = current_group.take() {
-                if group.has_nodes && group.revision_number > 0 {
-                    let rev = repo.commit(
-                        group.author,
-                        group.message,
-                        group.timestamp,
-                    ).await?;
-                    final_rev = rev;
-                    println!("  Committed revision {}", rev);
-                }
-            }
+        // Begin batch mode: suppress per-file root_tree persistence
+        repo.begin_batch();
 
-            println!("Processing revision {}", entry.revision_number);
+        let mut has_changes = false;
 
-            let author = entry.props.get("svn:author")
-                .cloned()
-                .unwrap_or_else(|| "unknown".to_string());
-            let message = entry.props.get("svn:log")
-                .cloned()
-                .unwrap_or_default();
-            let timestamp = entry.props.get("svn:date")
-                .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
-                .map(|dt| dt.timestamp())
-                .unwrap_or_else(|| chrono::Utc::now().timestamp());
-
-            current_group = Some(RevisionGroup {
-                revision_number: entry.revision_number,
-                author,
-                message,
-                timestamp,
-                has_nodes: false,
-            });
-
-        } else if entry.is_node() {
-            let path = entry.node_path.as_ref().unwrap();
-            let kind = entry.node_kind;
-            let action = entry.node_action;
-
-            if let Some(ref mut group) = current_group {
-                group.has_nodes = true;
-            }
+        for node in &revision.nodes {
+            let path = &node.path;
+            let kind = node.kind;
+            let action = node.action;
 
             match action {
                 Some(NodeAction::Add) | Some(NodeAction::Replace) => {
-                    if entry.copy_from_path.is_some() && entry.copy_from_rev.is_some() {
-                        println!("  Copy {} from {}@{}", path,
-                            entry.copy_from_path.as_ref().unwrap(),
-                            entry.copy_from_rev.unwrap());
+                    if node.copy_from_path.is_some() && node.copy_from_rev.is_some() {
                         // TODO: Implement copy operation
                     } else {
                         match kind {
                             Some(NodeKind::File) => {
-                                repo.add_file(path, entry.content.clone(), false).await?;
-                                println!("  Added file: {} ({} bytes)", path, entry.content.len());
+                                repo.add_file_sync(path, node.content.clone(), false)?;
+                                has_changes = true;
                             }
                             Some(NodeKind::Dir) => {
-                                repo.mkdir(path).await?;
-                                println!("  Created directory: {}", path);
+                                repo.mkdir_sync(path)?;
+                                has_changes = true;
                             }
                             None => {
-                                // Unknown kind — if has content, treat as file
-                                if !entry.content.is_empty() {
-                                    repo.add_file(path, entry.content.clone(), false).await?;
-                                    println!("  Added file (unknown kind): {}", path);
+                                if !node.content.is_empty() {
+                                    repo.add_file_sync(path, node.content.clone(), false)?;
+                                    has_changes = true;
                                 }
                             }
                         }
                     }
                 }
                 Some(NodeAction::Delete) => {
-                    repo.delete_file(path).await?;
-                    println!("  Deleted: {}", path);
+                    repo.delete_file_sync(path)?;
+                    has_changes = true;
                 }
                 Some(NodeAction::Change) => {
-                    if !entry.content.is_empty() {
-                        repo.add_file(path, entry.content.clone(), false).await?;
-                        println!("  Modified: {}", path);
+                    if !node.content.is_empty() {
+                        repo.add_file_sync(path, node.content.clone(), false)?;
+                        has_changes = true;
                     }
                 }
-                None => {
-                    // No action, just metadata
-                }
+                None => {}
             }
         }
-    }
 
-    // Flush the last revision group
-    if let Some(group) = current_group.take() {
-        if group.has_nodes && group.revision_number > 0 {
-            let rev = repo.commit(
-                group.author,
-                group.message,
-                group.timestamp,
-            ).await?;
-            final_rev = rev;
-            println!("  Committed revision {}", rev);
+        if has_changes {
+            let rev = repo.commit_sync(
+                revision.author.clone(),
+                revision.message.clone(),
+                revision.timestamp,
+            )?;
+            final_rev.store(rev, Ordering::SeqCst);
         }
-    }
 
-    println!("Load complete! Final revision: {}", final_rev);
+        // End batch mode: persist root_tree once
+        repo.end_batch();
+
+        let tr = total_revisions.fetch_add(1, Ordering::SeqCst) + 1;
+        total_nodes.fetch_add(node_count as u64, Ordering::SeqCst);
+
+        // Progress reporting: every 500 revisions or every 5 seconds
+        let now = Instant::now();
+        if tr % 500 == 0 || now.duration_since(last_report).as_secs() >= 5 {
+            let elapsed = start_time.elapsed().as_secs_f64();
+            let rate = tr as f64 / (elapsed / 60.0);
+            println!(
+                "  Progress: rev {} | {} revisions ({} nodes) in {:.1}s | {:.0} rev/min",
+                rev_num, tr, total_nodes.load(Ordering::SeqCst), elapsed, rate
+            );
+            last_report = now;
+        }
+
+        Ok(())
+    })?;
+
+    let elapsed = start_time.elapsed();
+    let tr = total_revisions.load(Ordering::SeqCst);
+    let rate = if elapsed.as_secs() > 0 {
+        tr as f64 / (elapsed.as_secs_f64() / 60.0)
+    } else {
+        tr as f64
+    };
+
+    println!("Load complete!");
+    println!("  Total revisions: {}", tr);
+    println!("  Total nodes: {}", total_nodes.load(Ordering::SeqCst));
+    println!("  Final revision: {}", final_rev.load(Ordering::SeqCst));
+    println!("  Elapsed: {:.1}s", elapsed.as_secs_f64());
+    println!("  Rate: {:.0} revisions/min", rate);
+
     Ok(())
 }

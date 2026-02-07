@@ -1,10 +1,232 @@
 //! SVN dump file parser
 //!
 //! Parses SVN dump format version 2/3 into structured `DumpFormat`.
+//! Supports both full in-memory parsing and streaming mode for large files.
 
 use crate::dump_format::{DumpEntry, DumpFormat, NodeAction, NodeKind};
 use anyhow::{anyhow, Result};
 use std::io::{BufRead, Read};
+
+// ===================== Streaming Parser =====================
+
+/// A single node change within a revision (streaming mode).
+pub struct StreamingNode {
+    pub path: String,
+    pub kind: Option<NodeKind>,
+    pub action: Option<NodeAction>,
+    pub copy_from_path: Option<String>,
+    pub copy_from_rev: Option<u64>,
+    pub content: Vec<u8>,
+}
+
+/// A complete revision with its node changes (streaming mode).
+pub struct StreamingRevision {
+    pub revision_number: u64,
+    pub author: String,
+    pub message: String,
+    pub timestamp: i64,
+    pub nodes: Vec<StreamingNode>,
+}
+
+/// Streaming SVN dump parser.
+///
+/// Parses the dump file incrementally and invokes `on_revision` for each
+/// complete revision (with all its nodes collected). This avoids loading
+/// the entire dump into memory.
+pub fn parse_dump_streaming<R, F>(mut reader: R, mut on_revision: F) -> Result<()>
+where
+    R: BufRead,
+    F: FnMut(StreamingRevision) -> Result<()>,
+{
+    let mut line_buf = String::new();
+    let mut current_rev: Option<StreamingRevision> = None;
+
+    loop {
+        line_buf.clear();
+        let bytes_read = reader.read_line(&mut line_buf)?;
+        if bytes_read == 0 {
+            break; // EOF
+        }
+
+        let trimmed = line_buf.trim();
+
+        // --- Top-level headers (skip) ---
+        if trimmed.starts_with("SVN-fs-dump-format-version:")
+            || trimmed.starts_with("UUID:")
+        {
+            continue;
+        }
+
+        // --- Revision header ---
+        if trimmed.starts_with("Revision-number:") {
+            // Flush previous revision
+            if let Some(rev) = current_rev.take() {
+                on_revision(rev)?;
+            }
+
+            let rev_num: u64 = parse_header_value(trimmed).parse().unwrap_or(0);
+
+            // Read revision properties block
+            let (prop_len, content_len) = read_content_headers(&mut reader)?;
+            let mut props = std::collections::HashMap::new();
+            if content_len > 0 || prop_len > 0 {
+                let total = if content_len > 0 { content_len } else { prop_len };
+                let mut buf = vec![0u8; total];
+                reader.read_exact(&mut buf)?;
+                if prop_len > 0 {
+                    props = parse_props(&buf[..prop_len]);
+                }
+            }
+
+            let author = props.get("svn:author")
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string());
+            let message = props.get("svn:log")
+                .cloned()
+                .unwrap_or_default();
+            let timestamp = props.get("svn:date")
+                .and_then(|d| chrono::DateTime::parse_from_rfc3339(d).ok())
+                .map(|dt| dt.timestamp())
+                .unwrap_or_else(|| chrono::Utc::now().timestamp());
+
+            current_rev = Some(StreamingRevision {
+                revision_number: rev_num,
+                author,
+                message,
+                timestamp,
+                nodes: Vec::new(),
+            });
+            continue;
+        }
+
+        // --- Node header ---
+        if trimmed.starts_with("Node-path:") {
+            let mut node = StreamingNode {
+                path: parse_header_value(trimmed),
+                kind: None,
+                action: None,
+                copy_from_path: None,
+                copy_from_rev: None,
+                content: Vec::new(),
+            };
+
+            // Read remaining node headers
+            loop {
+                line_buf.clear();
+                let n = reader.read_line(&mut line_buf)?;
+                if n == 0 { break; }
+                let t = line_buf.trim();
+                if t.is_empty() { break; }
+
+                if t.starts_with("Node-kind:") {
+                    let kind_str = parse_header_value(t);
+                    node.kind = match kind_str.as_str() {
+                        "file" => Some(NodeKind::File),
+                        "dir" => Some(NodeKind::Dir),
+                        _ => None,
+                    };
+                } else if t.starts_with("Node-action:") {
+                    let action_str = parse_header_value(t);
+                    node.action = match action_str.as_str() {
+                        "add" => Some(NodeAction::Add),
+                        "delete" => Some(NodeAction::Delete),
+                        "change" => Some(NodeAction::Change),
+                        "replace" => Some(NodeAction::Replace),
+                        _ => None,
+                    };
+                } else if t.starts_with("Node-copyfrom-path:") {
+                    node.copy_from_path = Some(parse_header_value(t));
+                } else if t.starts_with("Node-copyfrom-rev:") {
+                    node.copy_from_rev = Some(parse_header_value(t).parse().unwrap_or(0));
+                } else if t.starts_with("Prop-content-length:") {
+                    let prop_len: usize = parse_header_value(t).parse().unwrap_or(0);
+                    let mut text_len: usize = 0;
+                    let mut total_content_len: usize = 0;
+
+                    loop {
+                        line_buf.clear();
+                        let n2 = reader.read_line(&mut line_buf)?;
+                        if n2 == 0 { break; }
+                        let t2 = line_buf.trim();
+                        if t2.is_empty() { break; }
+                        if t2.starts_with("Text-content-length:") {
+                            text_len = parse_header_value(t2).parse().unwrap_or(0);
+                        } else if t2.starts_with("Content-length:") {
+                            total_content_len = parse_header_value(t2).parse().unwrap_or(0);
+                        }
+                        // ignore md5/sha1
+                    }
+
+                    let read_len = if total_content_len > 0 { total_content_len } else { prop_len + text_len };
+                    if read_len > 0 {
+                        let mut buf = vec![0u8; read_len];
+                        reader.read_exact(&mut buf)?;
+                        if text_len > 0 && prop_len + text_len <= buf.len() {
+                            node.content = buf[prop_len..prop_len + text_len].to_vec();
+                        }
+                    }
+                    line_buf.clear();
+                    let _ = reader.read_line(&mut line_buf);
+                    break;
+                } else if t.starts_with("Text-content-length:") {
+                    let text_len: usize = parse_header_value(t).parse().unwrap_or(0);
+                    let mut total_content_len: usize = 0;
+
+                    loop {
+                        line_buf.clear();
+                        let n2 = reader.read_line(&mut line_buf)?;
+                        if n2 == 0 { break; }
+                        let t2 = line_buf.trim();
+                        if t2.is_empty() { break; }
+                        if t2.starts_with("Content-length:") {
+                            total_content_len = parse_header_value(t2).parse().unwrap_or(0);
+                        }
+                    }
+
+                    let read_len = if total_content_len > 0 { total_content_len } else { text_len };
+                    if read_len > 0 {
+                        let mut buf = vec![0u8; read_len];
+                        reader.read_exact(&mut buf)?;
+                        node.content = buf[..text_len.min(read_len)].to_vec();
+                    }
+                    line_buf.clear();
+                    let _ = reader.read_line(&mut line_buf);
+                    break;
+                } else if t.starts_with("Content-length:") {
+                    let clen: usize = parse_header_value(t).parse().unwrap_or(0);
+                    loop {
+                        line_buf.clear();
+                        let n2 = reader.read_line(&mut line_buf)?;
+                        if n2 == 0 { break; }
+                        if line_buf.trim().is_empty() { break; }
+                    }
+                    if clen > 0 {
+                        let mut buf = vec![0u8; clen];
+                        reader.read_exact(&mut buf)?;
+                    }
+                    line_buf.clear();
+                    let _ = reader.read_line(&mut line_buf);
+                    break;
+                }
+                // Text-content-md5 etc. — ignore
+            }
+
+            if let Some(ref mut rev) = current_rev {
+                rev.nodes.push(node);
+            }
+            continue;
+        }
+    }
+
+    // Flush last revision
+    if let Some(rev) = current_rev.take() {
+        on_revision(rev)?;
+    }
+
+    Ok(())
+}
+
+// ===================== Original (full in-memory) Parser =====================
 
 /// Parse SVN dump file
 pub fn parse_dump_file<R: BufRead>(mut reader: R) -> Result<DumpFormat> {

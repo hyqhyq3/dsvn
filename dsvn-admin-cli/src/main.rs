@@ -10,6 +10,7 @@ use dsvn_core::DiskRepository;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(name = "dsvn-admin")]
@@ -63,16 +64,16 @@ async fn main() -> Result<()> {
             println!("Loading SVN dump file: {}", file);
             let repository = DiskRepository::open(Path::new(&repo))?;
             repository.initialize().await?;
+            let repository = Arc::new(repository);
 
             if file == "-" {
                 let reader = BufReader::new(std::io::stdin());
-                load::load_dump_file(&repository, reader).await?;
+                load::load_dump_file(repository, reader).await?;
             } else {
                 let file_obj = File::open(&file)?;
                 let reader = BufReader::new(file_obj);
-                load::load_dump_file(&repository, reader).await?;
+                load::load_dump_file(repository, reader).await?;
             }
-            println!("Load complete!");
         }
 
         Commands::Dump { repo, output: _output, start: _start, end: _end } => {
