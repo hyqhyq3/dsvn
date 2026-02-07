@@ -6,8 +6,10 @@ mod load;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use dsvn_core::DiskRepository;
 use std::fs::File;
 use std::io::BufReader;
+use std::path::Path;
 
 #[derive(Parser, Debug)]
 #[command(name = "dsvn-admin")]
@@ -29,7 +31,7 @@ enum Commands {
         #[arg(short, long)]
         file: String,
         #[arg(short, long)]
-        repo: Option<String>,
+        repo: String,
     },
 
     /// Dump repository to SVN dump format
@@ -52,16 +54,14 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Init { path } => {
             println!("Initializing repository at {}", path);
-            std::fs::create_dir_all(&path)?;
-            std::fs::create_dir_all(format!("{}/hot", path))?;
-            std::fs::create_dir_all(format!("{}/warm", path))?;
-            std::fs::create_dir_all(format!("{}/conf", path))?;
-            println!("Repository initialized successfully");
+            let repo = DiskRepository::open(Path::new(&path))?;
+            repo.initialize().await?;
+            println!("Repository initialized successfully (UUID: {})", repo.uuid());
         }
 
-        Commands::Load { file, repo: _ } => {
+        Commands::Load { file, repo } => {
             println!("Loading SVN dump file: {}", file);
-            let repository = dsvn_core::Repository::new();
+            let repository = DiskRepository::open(Path::new(&repo))?;
             repository.initialize().await?;
 
             if file == "-" {
@@ -75,7 +75,8 @@ async fn main() -> Result<()> {
             println!("Load complete!");
         }
 
-        Commands::Dump { repo: _repo, output: _output, start: _start, end: _end } => {
+        Commands::Dump { repo, output: _output, start: _start, end: _end } => {
+            let _repository = DiskRepository::open(Path::new(&repo))?;
             println!("Dump functionality coming soon");
         }
     }
