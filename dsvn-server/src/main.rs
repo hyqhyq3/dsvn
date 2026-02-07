@@ -7,7 +7,6 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use dsvn_core::Repository;
 use dsvn_webdav::{Config, WebDavHandler};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -15,6 +14,7 @@ use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use http_body_util::Full;
 use bytes::Bytes;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{error, info};
@@ -60,17 +60,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Start {
-            addr,
-            repo_root,
-            hot_path,
-            warm_path,
-            tls,
-            cert_file,
-            key_file,
-            max_connections: _,
-            debug,
-        } => {
+        Commands::Start { addr, repo_root, debug } => {
             // Initialize tracing
             let env_filter = if debug {
                 tracing_subscriber::EnvFilter::new("debug")
@@ -100,7 +90,7 @@ async fn main() -> Result<()> {
 
             // Start server
             let addr: SocketAddr = addr.parse()?;
-            let listener = TcpListener::bind(addr).await?;
+            let listener: tokio::net::TcpListener = TcpListener::bind(addr).await?;
 
             info!("Server listening on {}", addr);
             info!("Ready to accept SVN client connections");
@@ -139,16 +129,31 @@ async fn handle_request(
     req: Request<hyper::body::Incoming>,
     handler: Arc<WebDavHandler>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    // Log request details
     info!("Request: {} {}", req.method(), req.uri());
+    info!("Request Headers:");
+    for (name, value) in req.headers().iter() {
+        info!("  {}: {}", name, value.to_str().unwrap_or("<binary>"));
+    }
 
-    match handler.handle(req).await {
-        Ok(resp) => Ok(resp),
+    // Handle request
+    let response = match handler.handle(req).await {
+        Ok(resp) => resp,
         Err(e) => {
             error!("Request error: {}", e);
-            Ok(Response::builder()
+            Response::builder()
                 .status(500)
                 .body(Full::new(Bytes::from(format!("Error: {}", e))))
-                .unwrap())
+                .unwrap()
         }
+    };
+
+    // Log response details
+    info!("Response: {}", response.status());
+    info!("Response Headers:");
+    for (name, value) in response.headers().iter() {
+        info!("  {}: {}", name, value.to_str().unwrap_or("<binary>"));
     }
+
+    Ok(response)
 }

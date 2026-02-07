@@ -3,9 +3,10 @@
 //! Implements the WebDAV/DeltaV protocol used by SVN over HTTP
 
 pub mod handlers;
+pub mod proppatch;
 pub mod xml;
 
-pub use handlers::{report_handler, propfind_handler};
+pub use handlers::{report_handler, propfind_handler, options_handler};
 
 use hyper::{body::Incoming, Request, Response};
 use http_body_util::{BodyExt, Full};
@@ -63,6 +64,7 @@ impl WebDavHandler {
 
         // Route to appropriate handler
         match method.as_str() {
+            "OPTIONS" => self.handle_options(req).await,
             "PROPFIND" => self.handle_propfind(req).await,
             "PROPPATCH" => self.handle_proppatch(req).await,
             "REPORT" => self.handle_report(req).await,
@@ -73,6 +75,7 @@ impl WebDavHandler {
             "DELETE" => self.handle_delete(req).await,
             "PUT" => self.handle_put(req).await,
             "GET" => self.handle_get(req).await,
+            "HEAD" => self.handle_head(req).await,
             "LOCK" => self.handle_lock(req).await,
             "UNLOCK" => self.handle_unlock(req).await,
             "COPY" => self.handle_copy(req).await,
@@ -152,6 +155,20 @@ impl WebDavHandler {
     /// Handle MOVE requests
     async fn handle_move(&self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>, WebDavError> {
         handlers::move_handler(req, &self.config).await
+    }
+
+    /// Handle OPTIONS requests (SVN capability discovery)
+    async fn handle_options(&self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>, WebDavError> {
+        handlers::options_handler(req, &self.config).await
+    }
+
+    /// Handle HEAD requests
+    async fn handle_head(&self, _req: Request<Incoming>) -> Result<Response<Full<Bytes>>, WebDavError> {
+        Ok(Response::builder()
+            .status(200)
+            .header("Content-Type", "text/html")
+            .body(Full::new(Bytes::new()))
+            .unwrap())
     }
 }
 

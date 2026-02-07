@@ -1,0 +1,95 @@
+=== 1. OPTIONS response body ===
+
+
+=== 2. PROPFIND root (depth:0) ===
+<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:" xmlns:ns1="http://subversion.tigris.org/xmlns/dav/" xmlns:ns0="DAV:">
+  <D:response xmlns:lp1="DAV:" xmlns:lp3="http://subversion.tigris.org/xmlns/dav/">
+    <D:href>/svn/testrepo/</D:href>
+    <D:propstat>
+      <D:prop>
+        <lp1:version-controlled-configuration>
+          <D:href>/svn/testrepo/!svn/vcc/default</D:href>
+        </lp1:version-controlled-configuration>
+        <lp1:resourcetype>
+          <D:collection/>
+        </lp1:resourcetype>
+        <lp3:baseline-relative-path/>
+        <lp3:repository-uuid>bb84e6a3-3c4f-498d-9d13-500ced341bd7</lp3:repository-uuid>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>
+
+
+=== 3. PROPFIND VCC (checked-in) ===
+<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:" xmlns:ns0="DAV:">
+  <D:response xmlns:lp1="DAV:" xmlns:lp3="http://subversion.tigris.org/xmlns/dav/">
+    <D:href>/svn/testrepo/!svn/vcc/default</D:href>
+    <D:propstat>
+      <D:prop>
+        <lp1:checked-in>
+          <D:href>/svn/testrepo/!svn/bln/0</D:href>
+        </lp1:checked-in>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>
+
+
+=== 4. PROPFIND baseline ===
+<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:" xmlns:ns0="DAV:">
+  <D:response xmlns:lp1="DAV:" xmlns:lp3="http://subversion.tigris.org/xmlns/dav/">
+    <D:href>/svn/testrepo/!svn/bln/0</D:href>
+    <D:propstat>
+      <D:prop>
+        <lp1:baseline-collection>
+          <D:href>/svn/testrepo/!svn/bc/0/</D:href>
+        </lp1:baseline-collection>
+        <lp1:version-name>0</lp1:version-name>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>
+
+
+=== 5. REPORT update ===
+<?xml version="1.0" encoding="utf-8"?>
+<S:update-report xmlns:S="svn:" xmlns:V="http://subversion.tigris.org/xmlns/dav/" xmlns:D="DAV:" send-all="true" inline-props="true">
+  <S:target-revision rev="0"/>
+  <S:open-directory rev="0">
+    <D:checked-in>
+      <D:href>/svn/testrepo/!svn/ver/0/</D:href>
+    </D:checked-in>
+    <S:set-prop name="svn:entry:committed-rev">0</S:set-prop>
+    <S:set-prop name="svn:entry:committed-date">2026-02-06T17:32:58.667374Z</S:set-prop>
+    <S:set-prop name="svn:entry:uuid">bb84e6a3-3c4f-498d-9d13-500ced341bd7</S:set-prop>
+  </S:open-directory>
+</S:update-report>
+
+
+=== 6. OPTIONS response headers ===
+HTTP/1.1 200 OK
+Date: Fri, 06 Feb 2026 17:49:10 GMT
+Server: Apache/2.4.35 (Unix)
+DAV: 1,2
+DAV: version-control,checkout,working-resource
+DAV: merge,baseline,activity,version-controlled-collection
+DAV: http://subversion.tigris.org/xmlns/dav/svn/depth
+DAV: http://subversion.tigris.org/xmlns/dav/svn/log-revprops
+DAV: http://subversion.tigris.org/xmlns/dav/svn/atomic-revprops
+DAV: http://subversion.tigris.org/xmlns/dav/svn/partial-replay
+DAV: http://subversion.tigris.org/xmlns/dav/svn/inherited-props
+DAV: http://subversion.tigris.org/xmlns/dav/svn/inline-props
+DAV: http://subversion.tigris.org/xmlns/dav/svn/reverse-file-revs
+DAV: http://subversion.tigris.org/xmlns/dav/svn/mergeinfo
+DAV: <http://apache.org/dav/propset/fs/1>
+MS-Author-Via: DAV
+Allow: OPTIONS,GET,HEAD,POST,DELETE,TRACE,PROPFIND,PROPPATCH,COPY,MOVE,LOCK,UNLOCK,CHECKOUT
+Content-Length: 0
+

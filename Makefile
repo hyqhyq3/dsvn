@@ -1,4 +1,4 @@
-.PHONY: all build test clean quick-test acceptance-test help
+.PHONY: all build test clean quick-test acceptance-test protocol-test help
 
 # 默认目标
 all: build
@@ -14,6 +14,12 @@ quick-test: build
 	@chmod +x scripts/quick-test.sh
 	@./scripts/quick-test.sh
 
+# 协议验证测试（不依赖SVN客户端，解决macOS ARM segfault问题）
+protocol-test: build
+	@echo "🔌 运行协议验证测试（curl-based，无SVN客户端依赖）..."
+	@chmod +x scripts/protocol-validation.sh
+	@./scripts/protocol-validation.sh
+
 # 完整验收测试
 acceptance-test: build
 	@echo "🧪 运行完整验收测试..."
@@ -28,7 +34,7 @@ check:
 # 运行单元测试
 unit-test:
 	@echo "🧪 运行单元测试..."
-	cargo test --workspace
+	cargo test --workspace --lib
 
 # 代码格式化
 fmt:
@@ -51,6 +57,7 @@ stop-test:
 	@echo "🛑 停止测试服务器..."
 	@lsof -ti:8080 | xargs kill -9 2>/dev/null || true
 	@lsof -ti:8989 | xargs kill -9 2>/dev/null || true
+	@lsof -ti:8999 | xargs kill -9 2>/dev/null || true
 	@rm -rf /tmp/dsvn-*
 
 # 初始化测试仓库
@@ -81,9 +88,10 @@ help:
 	@echo "  make clippy         - 代码检查"
 	@echo ""
 	@echo "测试:"
-	@echo "  make quick-test     - 快速测试（日常开发）"
-	@echo "  make acceptance-test - 完整验收测试"
-	@echo "  make unit-test      - 单元测试"
+	@echo "  make unit-test      - 单元测试（56个测试）"
+	@echo "  make protocol-test  - 协议验证测试（curl-based，解决macOS ARM segfault）"
+	@echo "  make quick-test     - 快速测试（需要SVN客户端）"
+	@echo "  make acceptance-test - 完整验收测试（需要SVN客户端）"
 	@echo ""
 	@echo "服务器:"
 	@echo "  make init-repo      - 初始化测试仓库"
@@ -95,11 +103,11 @@ help:
 	@echo "  make clean          - 清理构建产物和测试数据"
 	@echo ""
 	@echo "示例:"
-	@echo "  make quick-test     - 快速验证所有功能"
-	@echo "  make acceptance-test - 运行完整的测试套件"
+	@echo "  make protocol-test  - 推荐：无SVN客户端依赖的协议测试"
+	@echo "  make dev            - 完整开发验证流程"
 
-# 开发工作流
-dev: fmt clippy build unit-test quick-test
+# 开发工作流（推荐：无SVN客户端依赖）
+dev: fmt clippy build unit-test protocol-test
 	@echo "✨ 开发流程完成！"
 
 # 生产构建检查

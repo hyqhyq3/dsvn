@@ -13,11 +13,11 @@ dsvn-core = { path = "../dsvn-core" }
 dsvn-webdav = { path = "../dsvn-webdav" }
 
 # Async
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
 
 # HTTP
 hyper = { workspace = true }
-hyper-util = { workspace = true }
+hyper-util = { workspace = true, features = ["tokio"] }
 tower = { workspace = true }
 tower-http = { workspace = true }
 

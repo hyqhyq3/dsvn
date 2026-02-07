@@ -11,6 +11,9 @@ pub mod object;
 pub mod storage;
 pub mod repository;
 pub mod persistent;
+pub mod hot_store;
+pub mod packfile;
+pub mod properties;
 
 #[cfg(test)]
 mod persistent_tests;
