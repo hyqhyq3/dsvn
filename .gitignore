@@ -28,3 +28,6 @@ Thumbs.db
 # Temporary
 /tmp/
 *.tmp
+
+# Build artifacts
+rust_out

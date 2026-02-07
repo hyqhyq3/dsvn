@@ -241,7 +241,7 @@ litmus http://localhost:8080/svn
 
 ## Contributing
 
-Contributions are welcome! Please see [DEVELOPMENT.md](DEVELOPMENT.md) for guidelines.
+Contributions are welcome! Please see [DEVELOPMENT.md](docs/overview/DEVELOPMENT.md) for guidelines.
 
 ## License
 
