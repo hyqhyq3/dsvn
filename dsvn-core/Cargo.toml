@@ -24,6 +24,7 @@ hex = { workspace = true }
 # Storage
 fjall = { workspace = true }
 sled = { workspace = true }
+rusqlite = { workspace = true }
 
 # Error handling
 anyhow = { workspace = true }

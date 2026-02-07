@@ -48,6 +48,7 @@ chrono = "0.4"
 # Storage
 fjall = "3.0"
 sled = { version = "0.34", features = [] }
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 # Error handling
 anyhow = "1.0"

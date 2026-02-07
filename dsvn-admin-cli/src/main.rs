@@ -6,7 +6,7 @@ mod load;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use dsvn_core::DiskRepository;
+use dsvn_core::SqliteRepository;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
@@ -55,14 +55,15 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Init { path } => {
             println!("Initializing repository at {}", path);
-            let repo = DiskRepository::open(Path::new(&path))?;
+            let repo = SqliteRepository::open(Path::new(&path))?;
             repo.initialize().await?;
             println!("Repository initialized successfully (UUID: {})", repo.uuid());
         }
 
         Commands::Load { file, repo } => {
             println!("Loading SVN dump file: {}", file);
-            let repository = DiskRepository::open(Path::new(&repo))?;
+            println!("  Backend: SQLite (WAL mode)");
+            let repository = SqliteRepository::open(Path::new(&repo))?;
             repository.initialize().await?;
             let repository = Arc::new(repository);
 
@@ -77,7 +78,7 @@ async fn main() -> Result<()> {
         }
 
         Commands::Dump { repo, output: _output, start: _start, end: _end } => {
-            let _repository = DiskRepository::open(Path::new(&repo))?;
+            let _repository = SqliteRepository::open(Path::new(&repo))?;
             println!("Dump functionality coming soon");
         }
     }

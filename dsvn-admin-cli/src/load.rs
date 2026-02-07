@@ -1,15 +1,11 @@
 //! Load SVN dump file into DSvn repository
 //!
 //! Optimized for high-throughput import of large SVN dump files.
-//! Key optimizations:
-//! - Streaming parser: processes entries as they are parsed, no full in-memory load
-//! - Batched disk writes: defers root_tree persistence until commit time
-//! - Progress reporting: only prints every N revisions to reduce IO
-//! - Efficient object storage: minimizes redundant serialization
+//! Uses SQLite with WAL mode for maximum write performance.
 
 use crate::dump_format::{NodeAction, NodeKind};
 use anyhow::Result;
-use dsvn_core::DiskRepository;
+use dsvn_core::SqliteRepository;
 use std::io::BufRead;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -17,23 +13,18 @@ use std::time::Instant;
 use tokio::task;
 
 /// Load SVN dump file into repository using streaming parser.
-///
-/// Runs the entire import in a blocking thread pool to avoid
-/// blocking the async runtime with synchronous disk operations.
 pub async fn load_dump_file<R: BufRead + Send + 'static>(
-    repo: Arc<DiskRepository>,
+    repo: Arc<SqliteRepository>,
     reader: R,
 ) -> Result<()> {
-    task::spawn_blocking(move || {
-        load_dump_file_blocking(&repo, reader)
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("Import task failed: {:?}", e))?
+    task::spawn_blocking(move || load_dump_file_blocking(&repo, reader))
+        .await
+        .map_err(|e| anyhow::anyhow!("Import task failed: {:?}", e))?
 }
 
 /// Blocking version of load_dump_file (runs in spawn_blocking context).
 fn load_dump_file_blocking<R: BufRead>(
-    repo: &DiskRepository,
+    repo: &SqliteRepository,
     reader: R,
 ) -> Result<()> {
     let start_time = Instant::now();
@@ -42,7 +33,6 @@ fn load_dump_file_blocking<R: BufRead>(
     let final_rev = AtomicU64::new(0);
     let mut last_report = Instant::now();
 
-    // Use the streaming parser — callback is invoked per revision
     crate::dump::parse_dump_streaming(reader, |revision| {
         let rev_num = revision.revision_number;
 
@@ -56,7 +46,7 @@ fn load_dump_file_blocking<R: BufRead>(
             return Ok(());
         }
 
-        // Begin batch mode: suppress per-file root_tree persistence
+        // Begin batch mode: wraps all operations in a single SQL transaction
         repo.begin_batch();
 
         let mut has_changes = false;
@@ -112,20 +102,24 @@ fn load_dump_file_blocking<R: BufRead>(
             final_rev.store(rev, Ordering::SeqCst);
         }
 
-        // End batch mode: persist root_tree once
+        // End batch mode: commits the SQL transaction
         repo.end_batch();
 
         let tr = total_revisions.fetch_add(1, Ordering::SeqCst) + 1;
         total_nodes.fetch_add(node_count as u64, Ordering::SeqCst);
 
-        // Progress reporting: every 500 revisions or every 5 seconds
+        // Progress reporting
         let now = Instant::now();
         if tr % 500 == 0 || now.duration_since(last_report).as_secs() >= 5 {
             let elapsed = start_time.elapsed().as_secs_f64();
             let rate = tr as f64 / (elapsed / 60.0);
             println!(
                 "  Progress: rev {} | {} revisions ({} nodes) in {:.1}s | {:.0} rev/min",
-                rev_num, tr, total_nodes.load(Ordering::SeqCst), elapsed, rate
+                rev_num,
+                tr,
+                total_nodes.load(Ordering::SeqCst),
+                elapsed,
+                rate
             );
             last_report = now;
         }
