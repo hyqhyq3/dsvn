@@ -227,6 +227,8 @@ impl SqliteRepository {
     pub async fn current_rev(&self) -> u64 { *self.current_rev.read().await }
     pub fn property_store(&self) -> &Arc<SqlitePropertyStore> { &self.property_store }
     pub fn hook_manager(&self) -> HookManager { HookManager::new(self.root.clone()) }
+    
+    pub fn root(&self) -> &Path { &self.root }
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> { self.tree_conn.lock().unwrap() }
 
     fn object_path(&self, id: &ObjectId) -> PathBuf { let h = id.to_hex(); self.root.join("objects").join(&h[..2]).join(&h[2..]) }
@@ -387,8 +389,10 @@ impl SqliteRepository {
 
             // Collect pending changes -> DeltaTree
             let (changes, total_entries) = conn_collect_pending(&c)?;
+            tracing::debug!("Collected {} changes for commit", changes.len());
 
             // Prepare hook data
+            tracing::info!("Creating HookManager with root: {:?}", self.root);
             let hook_mgr = HookManager::new(self.root.clone());
             let files: Vec<(String, String)> = changes.iter().map(|ch| match ch {
                 TreeChange::Upsert { path, .. } => ("A".into(), path.clone()),
@@ -399,9 +403,10 @@ impl SqliteRepository {
                 .unwrap_or_else(|| timestamp.to_string());
 
             // Run pre-commit hook (can reject the commit)
-            tracing::debug!("Running pre-commit hook for revision {}", nr);
+            tracing::info!("Running pre-commit hook for revision {}", nr);
+            tracing::info!("Hook files: {:?}", files);
             hook_mgr.run_pre_commit(nr, &author, &message, &date, &files)?;
-            tracing::debug!("Pre-commit hook passed for revision {}", nr);
+            tracing::info!("Pre-commit hook passed for revision {}", nr);
 
             let delta = DeltaTree::new(parent_rev, changes, total_entries);
 
