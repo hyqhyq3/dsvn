@@ -70,6 +70,24 @@ fn extract_text_between<'a>(s: &'a str, start_tag: &str, end_tag: &str) -> Optio
     Some(&s[start..end])
 }
 
+/// Parse SVN log revision range from the REPORT request body.
+/// Returns (start_rev, end_rev, reverse) where start <= end, and reverse indicates
+/// the original request was in descending order (e.g. `svn log -r 10:1`).
+fn parse_log_range(body: &str, current_rev: u64) -> (u64, u64, bool) {
+    let start = extract_text_between(body, "<S:start-revision>", "</S:start-revision>")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(1);
+    let end = extract_text_between(body, "<S:end-revision>", "</S:end-revision>")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(current_rev);
+
+    if start > end {
+        (end, start, true)
+    } else {
+        (start, end, false)
+    }
+}
+
 fn find_all_between(s: &str, start_tag: &str, end_tag: &str) -> Vec<String> {
     let mut results = Vec::new();
     let mut pos = 0;
@@ -431,17 +449,27 @@ pub async fn report_handler(req: Request<Incoming>, _config: &Config) -> Result<
             date=now.format("%Y-%m-%dT%H:%M:%S.000000Z"), uuid=uuid)
     } else if body_str.contains("log") {
         let current_rev = repo.current_rev().await;
-        let commits = repo.log(current_rev, 100).await.unwrap_or_default();
+        let (start_rev, end_rev, reverse) = parse_log_range(&body_str, current_rev);
+
+        let mut items = Vec::new();
+        for rev in start_rev..=end_rev {
+            if let Some(c) = repo.get_commit(rev).await {
+                items.push(format!(
+                    r#"<S:log-item><D:version-name>{}</D:version-name><D:creator-displayname>{}</D:creator-displayname><S:date>{}</S:date><D:comment>{}</D:comment></S:log-item>"#,
+                    rev, escape_xml(&c.author),
+                    chrono::DateTime::from_timestamp(c.timestamp, 0)
+                        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S.000000Z").to_string())
+                        .unwrap_or_default(),
+                    escape_xml(&c.message)));
+            }
+        }
+        if reverse {
+            items.reverse();
+        }
+
         let mut s = String::from(r#"<?xml version="1.0" encoding="utf-8"?><S:log-report xmlns:S="svn:" xmlns:D="DAV:">"#);
-        for (i, c) in commits.iter().enumerate() {
-            let rev = current_rev - i as u64;
-            s.push_str(&format!(
-                r#"<S:log-item><D:version-name>{}</D:version-name><D:creator-displayname>{}</D:creator-displayname><S:date>{}</S:date><D:comment>{}</D:comment></S:log-item>"#,
-                rev, escape_xml(&c.author),
-                chrono::DateTime::from_timestamp(c.timestamp, 0)
-                    .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S.000000Z").to_string())
-                    .unwrap_or_default(),
-                escape_xml(&c.message)));
+        for item in items {
+            s.push_str(&item);
         }
         s.push_str("</S:log-report>");
         s

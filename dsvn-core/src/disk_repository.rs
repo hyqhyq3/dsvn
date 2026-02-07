@@ -702,6 +702,11 @@ impl DiskRepository {
         Ok(new_rev)
     }
 
+    /// Get a single commit by revision number
+    pub async fn get_commit(&self, rev: u64) -> Option<Commit> {
+        self.load_commit(rev).ok()
+    }
+
     /// Get commit log (newest first)
     pub async fn log(&self, start_rev: u64, limit: usize) -> Result<Vec<Commit>> {
         let current = *self.current_rev.read().await;
