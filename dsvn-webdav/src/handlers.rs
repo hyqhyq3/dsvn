@@ -17,6 +17,8 @@ struct Transaction {
     pub log_message: String,
     pub created_at: i64,
     pub staged_files: HashMap<String, Vec<u8>>,
+    /// path -> (prop_name -> prop_value) for properties set during commit
+    pub staged_properties: HashMap<String, HashMap<String, String>>,
 }
 
 lazy_static::lazy_static! {
@@ -52,6 +54,47 @@ fn extract_text_between<'a>(s: &'a str, start_tag: &str, end_tag: &str) -> Optio
     let start = s.find(start_tag)? + start_tag.len();
     let end = s[start..].find(end_tag)? + start;
     Some(&s[start..end])
+}
+
+fn find_all_between(s: &str, start_tag: &str, end_tag: &str) -> Vec<String> {
+    let mut results = Vec::new();
+    let mut pos = 0;
+    while pos < s.len() {
+        if let Some(start) = s[pos..].find(start_tag) {
+            let abs_start = pos + start;
+            let content_start = abs_start + start_tag.len();
+            if let Some(end) = s[content_start..].find(end_tag) {
+                let abs_end = content_start + end + end_tag.len();
+                results.push(s[abs_start..abs_end].to_string());
+                pos = abs_end;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    results
+}
+
+/// Convert namespace-prefixed tag to SVN property name.
+/// C:mykey -> mykey (custom property)
+/// S:executable -> svn:executable  
+/// V:something -> something (dav property)
+fn convert_ns_tag_to_prop_name(ns_tag: &str) -> String {
+    if let Some(pos) = ns_tag.find(':') {
+        let prefix = &ns_tag[..pos];
+        let local = &ns_tag[pos + 1..];
+        match prefix {
+            "S" | "ns1" => format!("svn:{}", local),
+            "C" | "ns2" => local.to_string(),     // custom properties: just local name
+            "V" | "ns3" => local.to_string(),       // dav properties
+            "D" | "ns0" => local.to_string(),       // DAV core
+            _ => local.to_string(),
+        }
+    } else {
+        ns_tag.to_string()
+    }
 }
 
 fn read_varint(data: &[u8], pos: usize) -> (u64, usize) {
@@ -191,6 +234,7 @@ pub async fn post_handler(req: Request<Incoming>, _config: &Config) -> Result<Re
             author: String::new(), log_message: String::new(),
             created_at: chrono::Utc::now().timestamp(),
             staged_files: HashMap::new(),
+            staged_properties: HashMap::new(),
         };
         TRANSACTIONS.write().await.insert(txn_name.clone(), txn);
         tracing::info!("Created transaction: {}", txn_name);
@@ -417,6 +461,16 @@ pub async fn merge_handler(req: Request<Incoming>, _config: &Config) -> Result<R
         REPOSITORY.add_file(file_path, content.clone(), executable).await
             .map_err(|e| WebDavError::Internal(format!("Failed to add file {}: {}", file_path, e)))?;
     }
+    // Apply staged properties
+    for (file_path, props) in &txn.staged_properties {
+        for (prop_name, prop_value) in props {
+            tracing::info!("MERGE: setting property {}={} on {}", prop_name, prop_value, file_path);
+            // Normalize path: /foo.txt -> /svn/foo.txt for property store
+            let store_path = format!("{}{}", REPO_PREFIX, file_path);
+            PROPERTY_STORE.set(store_path, prop_name.clone(), prop_value.clone()).await
+                .map_err(|e| WebDavError::Internal(format!("Failed to set property {} on {}: {}", prop_name, file_path, e)))?;
+        }
+    }
     let author = if txn.author.is_empty() { "anonymous".to_string() } else { txn.author.clone() };
     let message = if txn.log_message.is_empty() { "No log message".to_string() } else { txn.log_message.clone() };
     let now = chrono::Utc::now();
@@ -475,6 +529,28 @@ pub async fn proppatch_handler(req: Request<Incoming>, _config: &Config) -> Resu
     let body_str = String::from_utf8_lossy(&body);
     tracing::info!("PROPPATCH {} body: {}", path, body_str);
     let special = path.strip_prefix(REPO_PREFIX).unwrap_or(&path);
+    // Handle PROPPATCH on transaction root files (!svn/txr/<txn>/<path>)
+    if special.starts_with("/!svn/txr/") {
+        // This is a property change on a file within a transaction
+        // Extract txn name and file path
+        let rest = special.strip_prefix("/!svn/txr/").unwrap_or("");
+        let (txn_name, _file_path) = rest.split_once('/').unwrap_or((rest, ""));
+        tracing::info!("PROPPATCH for txr file: txn={}, file={}", txn_name, _file_path);
+        // For now, acknowledge the property change (store in transaction if needed)
+        let xml = format!(r#"<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:" xmlns:ns3="http://subversion.tigris.org/xmlns/dav/" xmlns:ns2="http://subversion.tigris.org/xmlns/custom/" xmlns:ns1="http://subversion.tigris.org/xmlns/svn/" xmlns:ns0="DAV:">
+<D:response>
+<D:href>{path}</D:href>
+<D:propstat>
+<D:prop/>
+<D:status>HTTP/1.1 200 OK</D:status>
+</D:propstat>
+</D:response>
+</D:multistatus>"#, path=path);
+        return Ok(Response::builder().status(207)
+            .header("Content-Type", "text/xml; charset=\"utf-8\"")
+            .body(Full::new(Bytes::from(xml))).unwrap());
+    }
     if special.starts_with("/!svn/txn/") {
         let txn_name = special.strip_prefix("/!svn/txn/").unwrap_or("").to_string();
         tracing::info!("PROPPATCH for txn: {}", txn_name);
@@ -503,6 +579,7 @@ pub async fn proppatch_handler(req: Request<Incoming>, _config: &Config) -> Resu
             .header("Content-Type", "text/xml; charset=\"utf-8\"")
             .body(Full::new(Bytes::from(xml))).unwrap());
     }
+
     // Fallback to generic proppatch
     use crate::proppatch::{PropPatchRequest, PropPatchResponse};
     let proppatch_req = match PropPatchRequest::from_xml(&body_str) {

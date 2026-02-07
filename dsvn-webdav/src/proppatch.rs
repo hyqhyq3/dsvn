@@ -96,7 +96,7 @@ impl PropPatchResponse {
         Self {
             href,
             propstats: vec![PropStat {
-                status: "200 OK".to_string(),
+                status: "HTTP/1.1 200 OK".to_string(),
                 responsedescription: None,
                 props: vec![],
             }],
@@ -108,7 +108,7 @@ impl PropPatchResponse {
         Self {
             href,
             propstats: vec![PropStat {
-                status: "403 Forbidden".to_string(),
+                status: "HTTP/1.1 403 Forbidden".to_string(),
                 responsedescription: Some(message),
                 props: vec![],
             }],
