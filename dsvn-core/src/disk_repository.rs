@@ -71,6 +71,10 @@ pub struct DiskRepository {
     property_store: Arc<DiskPropertyStore>,
     /// Batch mode flag: when true, skip per-operation flush
     batch_mode: std::sync::atomic::AtomicBool,
+    /// Commit lock: serializes commit operations to prevent concurrent revision conflicts.
+    /// Uses tokio::sync::Mutex so it can be held across `.await` points.
+    /// For sync `commit_sync()`, use `blocking_lock()`.
+    commit_lock: tokio::sync::Mutex<()>,
 }
 
 /// Disk-backed property store
@@ -226,6 +230,7 @@ impl DiskRepository {
             tree_db,
             property_store,
             batch_mode: std::sync::atomic::AtomicBool::new(false),
+            commit_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -544,6 +549,9 @@ impl DiskRepository {
         message: String,
         timestamp: i64,
     ) -> Result<u64> {
+        // Serialize commits to prevent concurrent revision conflicts
+        let _lock = self.commit_lock.lock().await;
+
         // Build Tree from sled and serialize
         let root_tree = self.build_tree_from_sled()?;
         let tree_id = root_tree.id();
@@ -661,6 +669,9 @@ impl DiskRepository {
         message: String,
         timestamp: i64,
     ) -> Result<u64> {
+        // Serialize commits to prevent concurrent revision conflicts
+        let _lock = self.commit_lock.blocking_lock();
+
         // Build Tree from sled for the commit snapshot
         let root_tree = self.build_tree_from_sled()?;
         let tree_id = root_tree.id();
@@ -936,6 +947,61 @@ mod tests {
             assert_eq!(entry.unwrap().kind, ObjectKind::Blob);
             // root_tree.bin should be removed after migration
             assert!(!tmp.path().join("root_tree.bin").exists());
+        }
+    }
+
+    /// Test that concurrent commits produce distinct, sequential revisions
+    /// and no data is lost or overwritten.
+    #[tokio::test]
+    async fn test_disk_repo_concurrent_commits() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Arc::new(DiskRepository::open(tmp.path()).unwrap());
+        repo.initialize().await.unwrap();
+
+        let num_clients = 5;
+        let mut handles = Vec::new();
+
+        for i in 0..num_clients {
+            let repo_clone = Arc::clone(&repo);
+            handles.push(tokio::spawn(async move {
+                let path = format!("/client_{}.txt", i);
+                let content = format!("data from client {}", i);
+                repo_clone.add_file(&path, content.into_bytes(), false).await.unwrap();
+                let rev = repo_clone.commit(
+                    format!("client_{}", i),
+                    format!("commit from client {}", i),
+                    1000 + i as i64,
+                ).await.unwrap();
+                rev
+            }));
+        }
+
+        let mut revisions = Vec::new();
+        for handle in handles {
+            revisions.push(handle.await.unwrap());
+        }
+
+        // All revisions must be unique
+        revisions.sort();
+        let unique: std::collections::HashSet<u64> = revisions.iter().copied().collect();
+        assert_eq!(unique.len(), num_clients as usize, "All revisions must be unique, got: {:?}", revisions);
+
+        // Revisions must be sequential: 1, 2, 3, 4, 5
+        assert_eq!(revisions, vec![1, 2, 3, 4, 5], "Revisions should be sequential");
+
+        // Final rev should be num_clients
+        assert_eq!(repo.current_rev().await, num_clients as u64);
+
+        // All client files should be readable at the final revision
+        for i in 0..num_clients {
+            let path = format!("/client_{}.txt", i);
+            let content = repo.get_file(&path, num_clients as u64).await.unwrap();
+            assert_eq!(
+                content.as_ref(),
+                format!("data from client {}", i).as_bytes(),
+                "File {} should be readable at final revision",
+                path
+            );
         }
     }
 }

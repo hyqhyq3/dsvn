@@ -30,6 +30,11 @@ lazy_static::lazy_static! {
     static ref TXN_COUNTER: Arc<std::sync::atomic::AtomicU64> = {
         Arc::new(std::sync::atomic::AtomicU64::new(0))
     };
+    /// Global commit lock: serializes the entire "stage files → commit" sequence
+    /// to prevent concurrent merges from interleaving on the shared working tree.
+    static ref COMMIT_LOCK: tokio::sync::Mutex<()> = {
+        tokio::sync::Mutex::new(())
+    };
 }
 
 /// Initialize the global disk repository. Must be called once at server startup.
@@ -498,6 +503,12 @@ pub async fn merge_handler(req: Request<Incoming>, _config: &Config) -> Result<R
         Some(t) => t,
         None => return Ok(Response::builder().status(404).body(Full::new(Bytes::from("Transaction not found"))).unwrap()),
     };
+
+    // Acquire the commit lock to serialize the entire "stage files → commit" sequence.
+    // This prevents concurrent merges from interleaving add_file() calls on the shared
+    // working tree and racing on revision numbers.
+    let _commit_guard = COMMIT_LOCK.lock().await;
+
     for (file_path, content) in &txn.staged_files {
         let executable = file_path.ends_with(".sh") || file_path.contains("/bin/");
         tracing::info!("MERGE: adding file {} ({} bytes)", file_path, content.len());
@@ -518,6 +529,10 @@ pub async fn merge_handler(req: Request<Incoming>, _config: &Config) -> Result<R
     let now = chrono::Utc::now();
     let new_rev = repo.commit(author.clone(), message, now.timestamp()).await
         .map_err(|e| WebDavError::Internal(e.to_string()))?;
+
+    // Release the commit lock (implicit drop at end of scope)
+    drop(_commit_guard);
+
     tracing::info!("Committed revision {}", new_rev);
     let xml = format!(r#"<?xml version="1.0" encoding="utf-8"?>
 <D:merge-response xmlns:D="DAV:">
