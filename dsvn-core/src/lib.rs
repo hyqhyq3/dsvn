@@ -16,6 +16,7 @@ pub mod persistent;
 pub mod disk_repository;
 pub mod sqlite_repository;
 pub mod hot_store;
+pub mod hooks;
 pub mod packfile;
 pub mod properties;
 
@@ -27,4 +28,5 @@ pub use repository::Repository;
 pub use persistent::{PersistentRepository, RepositoryMetadata};
 pub use disk_repository::{DiskRepository, DiskPropertyStore};
 pub use sqlite_repository::{SqliteRepository, SqlitePropertyStore};
+pub use hooks::HookManager;
 pub use storage::{HotStore, ObjectStore, Result, StorageError, TieredStore, WarmStore};

@@ -4,6 +4,7 @@
 //! Trees are reconstructed on demand with LRU caching.
 //! Full snapshots every SNAPSHOT_INTERVAL revisions bound reconstruction cost.
 
+use crate::hooks::HookManager;
 use crate::object::{Blob, Commit, DeltaTree, ObjectId, ObjectKind, Tree, TreeChange, TreeEntry};
 use crate::properties::PropertySet;
 use anyhow::{anyhow, Context, Result};
@@ -225,6 +226,7 @@ impl SqliteRepository {
     pub fn uuid(&self) -> &str { &self.uuid }
     pub async fn current_rev(&self) -> u64 { *self.current_rev.read().await }
     pub fn property_store(&self) -> &Arc<SqlitePropertyStore> { &self.property_store }
+    pub fn hook_manager(&self) -> HookManager { HookManager::new(self.root.clone()) }
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> { self.tree_conn.lock().unwrap() }
 
     fn object_path(&self, id: &ObjectId) -> PathBuf { let h = id.to_hex(); self.root.join("objects").join(&h[..2]).join(&h[2..]) }
@@ -378,21 +380,42 @@ impl SqliteRepository {
         let cr = *self.current_rev.read().await;
         let nr = cr + 1;
         let parent_rev = if nr > 1 { nr - 1 } else { 0 };
-        let c = self.conn();
 
-        // Collect pending changes -> DeltaTree
-        let (changes, total_entries) = conn_collect_pending(&c)?;
-        let delta = DeltaTree::new(parent_rev, changes, total_entries);
+        // Scope the connection guard so it's dropped before any await
+        let (delta, root_tree, hook_mgr, _files, date) = {
+            let c = self.conn();
 
-        // Still build full Tree for commit's tree_id (backward compat)
-        let root_tree = conn_build_tree(&c)?;
+            // Collect pending changes -> DeltaTree
+            let (changes, total_entries) = conn_collect_pending(&c)?;
+
+            // Prepare hook data
+            let hook_mgr = HookManager::new(self.root.clone());
+            let files: Vec<(String, String)> = changes.iter().map(|ch| match ch {
+                TreeChange::Upsert { path, .. } => ("A".into(), path.clone()),
+                TreeChange::Delete { path } => ("D".into(), path.clone()),
+            }).collect();
+            let date = chrono::DateTime::from_timestamp(timestamp, 0)
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_else(|| timestamp.to_string());
+
+            // Run pre-commit hook (can reject the commit)
+            hook_mgr.run_pre_commit(nr, &author, &message, &date, &files)?;
+
+            let delta = DeltaTree::new(parent_rev, changes, total_entries);
+
+            // Still build full Tree for commit's tree_id (backward compat)
+            let root_tree = conn_build_tree(&c)?;
+
+            (delta, root_tree, hook_mgr, files, date)
+        }; // c is dropped here
+
         let tree_id = root_tree.id();
         self.store_object(&tree_id, &root_tree.to_bytes()?)?;
 
         let parents = if cr > 0 || self.commit_path(cr).exists() {
             self.load_commit(cr).map(|cc| vec![cc.id()]).unwrap_or_default()
         } else { vec![] };
-        let commit = Commit::new(tree_id, parents, author, message, timestamp, 0);
+        let commit = Commit::new(tree_id, parents, author.clone(), message.clone(), timestamp, 0);
         self.store_object(&commit.id(), &commit.to_bytes()?)?;
         self.store_commit(nr, &commit)?;
 
@@ -406,6 +429,10 @@ impl SqliteRepository {
 
         self.save_head(nr)?;
         *self.current_rev.write().await = nr;
+
+        // Run post-commit hook (fire-and-forget)
+        hook_mgr.run_post_commit(nr, &author, &message, &date)?;
+
         Ok(nr)
     }
 
@@ -451,6 +478,18 @@ impl SqliteRepository {
 
         // Collect pending changes -> DeltaTree (O(changes) not O(total_files))
         let (changes, total_entries) = conn_collect_pending(&c)?;
+
+        // Run pre-commit hook (can reject the commit)
+        let hook_mgr = HookManager::new(self.root.clone());
+        let files: Vec<(String, String)> = changes.iter().map(|ch| match ch {
+            TreeChange::Upsert { path, .. } => ("A".into(), path.clone()),
+            TreeChange::Delete { path } => ("D".into(), path.clone()),
+        }).collect();
+        let date = chrono::DateTime::from_timestamp(timestamp, 0)
+            .map(|dt| dt.to_rfc3339())
+            .unwrap_or_else(|| timestamp.to_string());
+        hook_mgr.run_pre_commit(nr, &author, &message, &date, &files)?;
+
         let delta = DeltaTree::new(parent_rev, changes, total_entries);
 
         // Only build the full tree when we need a periodic snapshot
@@ -471,7 +510,7 @@ impl SqliteRepository {
         let parents = if cr > 0 || self.commit_path(cr).exists() {
             self.load_commit(cr).map(|cc| vec![cc.id()]).unwrap_or_default()
         } else { vec![] };
-        let commit = Commit::new(tree_id, parents, author, message, timestamp, 0);
+        let commit = Commit::new(tree_id, parents, author.clone(), message.clone(), timestamp, 0);
         self.store_object(&commit.id(), &commit.to_bytes()?)?;
         self.store_commit(nr, &commit)?;
 
@@ -480,6 +519,10 @@ impl SqliteRepository {
 
         self.save_head(nr)?;
         *self.current_rev.blocking_write() = nr;
+
+        // Run post-commit hook (fire-and-forget)
+        hook_mgr.run_post_commit(nr, &author, &message, &date)?;
+
         Ok(nr)
     }
 
@@ -734,5 +777,111 @@ mod tests {
                 path
             );
         }
+    }
+
+    // ==================== Hook integration tests ====================
+
+    fn create_hook(repo_path: &Path, name: &str, script: &str) {
+        let hooks_dir = repo_path.join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let hook_path = hooks_dir.join(name);
+        std::fs::write(&hook_path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pre_commit_hook_rejects_async_commit() {
+        let tmp = TempDir::new().unwrap();
+        let repo = SqliteRepository::open(tmp.path()).unwrap();
+        repo.initialize().await.unwrap();
+
+        // Install a pre-commit hook that rejects
+        create_hook(
+            tmp.path(),
+            "pre-commit",
+            "#!/bin/bash\necho 'Blocked by hook' >&2\nexit 1\n",
+        );
+
+        repo.add_file("/test.txt", b"hello".to_vec(), false).await.unwrap();
+        let result = repo.commit("user".into(), "test".into(), 1000).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Blocked by hook"), "got: {}", err);
+
+        // Revision should still be 0 (commit was rejected)
+        assert_eq!(repo.current_rev().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_pre_commit_hook_allows_async_commit() {
+        let tmp = TempDir::new().unwrap();
+        let repo = SqliteRepository::open(tmp.path()).unwrap();
+        repo.initialize().await.unwrap();
+
+        create_hook(
+            tmp.path(),
+            "pre-commit",
+            "#!/bin/bash\nexit 0\n",
+        );
+
+        repo.add_file("/test.txt", b"hello".to_vec(), false).await.unwrap();
+        let rev = repo.commit("user".into(), "test commit".into(), 1000).await.unwrap();
+        assert_eq!(rev, 1);
+    }
+
+    #[test]
+    fn test_pre_commit_hook_rejects_sync_commit() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let repo = SqliteRepository::open(tmp.path()).unwrap();
+        rt.block_on(repo.initialize()).unwrap();
+
+        create_hook(
+            tmp.path(),
+            "pre-commit",
+            "#!/bin/bash\necho 'Sync reject' >&2\nexit 1\n",
+        );
+
+        repo.add_file_sync("test.txt", b"data".to_vec(), false).unwrap();
+        let result = repo.commit_sync("user".into(), "msg".into(), 1000);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Sync reject"));
+    }
+
+    #[tokio::test]
+    async fn test_post_commit_hook_runs_after_commit() {
+        let tmp = TempDir::new().unwrap();
+        let repo = SqliteRepository::open(tmp.path()).unwrap();
+        repo.initialize().await.unwrap();
+
+        let marker = tmp.path().join("post_commit_ran");
+        create_hook(
+            tmp.path(),
+            "post-commit",
+            &format!(
+                "#!/bin/bash\ntouch {}\nexit 0\n",
+                marker.display()
+            ),
+        );
+
+        repo.add_file("/test.txt", b"hello".to_vec(), false).await.unwrap();
+        repo.commit("user".into(), "test".into(), 1000).await.unwrap();
+
+        assert!(marker.exists(), "post-commit hook should have created marker file");
+    }
+
+    #[tokio::test]
+    async fn test_no_hook_allows_commit() {
+        let tmp = TempDir::new().unwrap();
+        let repo = SqliteRepository::open(tmp.path()).unwrap();
+        repo.initialize().await.unwrap();
+
+        repo.add_file("/test.txt", b"hello".to_vec(), false).await.unwrap();
+        let rev = repo.commit("user".into(), "test".into(), 1000).await.unwrap();
+        assert_eq!(rev, 1);
     }
 }
