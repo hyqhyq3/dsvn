@@ -80,6 +80,7 @@ impl WebDavHandler {
             "UNLOCK" => self.handle_unlock(req).await,
             "COPY" => self.handle_copy(req).await,
             "MOVE" => self.handle_move(req).await,
+            "POST" => self.handle_post(req).await,
             _ => Ok(Response::builder()
                 .status(405)
                 .body(Full::new(Bytes::from("Method Not Allowed")))
@@ -162,13 +163,14 @@ impl WebDavHandler {
         handlers::options_handler(req, &self.config).await
     }
 
+    /// Handle POST requests (create-txn)
+    async fn handle_post(&self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>, WebDavError> {
+        handlers::post_handler(req, &self.config).await
+    }
+
     /// Handle HEAD requests
-    async fn handle_head(&self, _req: Request<Incoming>) -> Result<Response<Full<Bytes>>, WebDavError> {
-        Ok(Response::builder()
-            .status(200)
-            .header("Content-Type", "text/html")
-            .body(Full::new(Bytes::new()))
-            .unwrap())
+    async fn handle_head(&self, req: Request<Incoming>) -> Result<Response<Full<Bytes>>, WebDavError> {
+        handlers::head_handler(req, &self.config).await
     }
 }
 
