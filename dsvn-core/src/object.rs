@@ -243,6 +243,52 @@ impl Commit {
     }
 }
 
+/// Incremental tree change (delta relative to parent revision)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TreeChange {
+    /// Add or modify a file/directory
+    Upsert { path: String, entry: TreeEntry },
+    /// Delete a file/directory
+    Delete { path: String },
+}
+
+/// Incremental tree stored on disk (like a git tree diff)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeltaTree {
+    /// Parent revision (0 means empty base)
+    pub parent_rev: u64,
+    /// Changes relative to parent revision
+    pub changes: Vec<TreeChange>,
+    /// Total file/directory count after applying changes
+    pub total_entries: usize,
+}
+
+impl DeltaTree {
+    /// Create a new delta tree
+    pub fn new(parent_rev: u64, changes: Vec<TreeChange>, total_entries: usize) -> Self {
+        Self {
+            parent_rev,
+            changes,
+            total_entries,
+        }
+    }
+
+    /// Serialize to binary format
+    pub fn to_bytes(&self) -> Result<Vec<u8>, bincode::Error> {
+        bincode::serialize(self)
+    }
+
+    /// Deserialize from binary format
+    pub fn from_bytes(data: &[u8]) -> Result<Self, bincode::Error> {
+        bincode::deserialize(data)
+    }
+
+    /// Compute the object ID
+    pub fn id(&self) -> ObjectId {
+        ObjectId::from_data(&bincode::serialize(self).unwrap_or_default())
+    }
+}
+
 /// Generic object that can be any type
 #[derive(Debug, Clone)]
 pub enum Object {

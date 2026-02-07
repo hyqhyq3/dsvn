@@ -22,7 +22,7 @@ pub mod properties;
 #[cfg(test)]
 mod persistent_tests;
 
-pub use object::{Blob, Commit, Object, ObjectId, ObjectKind, Tree, TreeEntry};
+pub use object::{Blob, Commit, DeltaTree, Object, ObjectId, ObjectKind, Tree, TreeChange, TreeEntry};
 pub use repository::Repository;
 pub use persistent::{PersistentRepository, RepositoryMetadata};
 pub use disk_repository::{DiskRepository, DiskPropertyStore};

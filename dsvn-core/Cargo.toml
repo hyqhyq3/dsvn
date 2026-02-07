@@ -41,6 +41,9 @@ uuid = { version = "1.10", features = ["v4"] }
 # Time
 chrono = { workspace = true }
 
+# Caching
+lru = "0.12"
+
 [dev-dependencies]
 criterion = "0.5"
 proptest = "1.5"

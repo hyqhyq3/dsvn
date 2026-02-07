@@ -1,51 +1,44 @@
-//! SQLite-backed repository implementation
+//! SQLite-backed repository with incremental (delta) tree storage.
 //!
-//! Stores objects on disk using content-addressed filesystem (like git objects).
-//! The working tree (file path -> entry mapping) is stored in an SQLite database
-//! with WAL mode for high write throughput.
+//! Each commit stores only changes (DeltaTree) instead of full tree snapshots.
+//! Trees are reconstructed on demand with LRU caching.
+//! Full snapshots every SNAPSHOT_INTERVAL revisions bound reconstruction cost.
 
-use crate::object::{Blob, Commit, ObjectId, ObjectKind, Tree, TreeEntry};
+use crate::object::{Blob, Commit, DeltaTree, ObjectId, ObjectKind, Tree, TreeChange, TreeEntry};
 use crate::properties::PropertySet;
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
+use lru::LruCache;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 
-/// Mirror of sled's TreeEntryRecord for migration purposes only
+const SNAPSHOT_INTERVAL: u64 = 1000;
+const TREE_CACHE_CAPACITY: usize = 64;
+
 #[derive(Serialize, Deserialize)]
-struct SledTreeEntryRecord {
-    object_id: ObjectId,
-    kind: ObjectKind,
-    mode: u32,
-}
+struct SledTreeEntryRecord { object_id: ObjectId, kind: ObjectKind, mode: u32 }
 
-fn kind_to_i64(kind: ObjectKind) -> i64 {
-    match kind {
-        ObjectKind::Blob => 0,
-        ObjectKind::Tree => 1,
-        _ => 0,
-    }
-}
+fn kind_to_i64(k: ObjectKind) -> i64 { match k { ObjectKind::Blob => 0, ObjectKind::Tree => 1, _ => 0 } }
+fn i64_to_kind(i: i64) -> ObjectKind { if i == 0 { ObjectKind::Blob } else { ObjectKind::Tree } }
+fn bytes_to_oid(b: &[u8]) -> ObjectId { let mut a = [0u8; 32]; if b.len() == 32 { a.copy_from_slice(b); } ObjectId::new(a) }
 
-fn i64_to_kind(i: i64) -> ObjectKind {
-    if i == 0 { ObjectKind::Blob } else { ObjectKind::Tree }
+fn tree_to_map(tree: &Tree) -> HashMap<String, TreeEntry> {
+    tree.entries.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
 }
-
-fn bytes_to_oid(bytes: &[u8]) -> ObjectId {
-    let mut arr = [0u8; 32];
-    if bytes.len() == 32 { arr.copy_from_slice(bytes); }
-    ObjectId::new(arr)
+fn map_to_tree(map: &HashMap<String, TreeEntry>) -> Tree {
+    let mut t = Tree::new(); for e in map.values() { t.insert(e.clone()); } t
 }
 
 fn open_tree_db(root: &Path) -> Result<Connection> {
     let db_path = root.join("tree.sqlite");
     let conn = Connection::open(&db_path)
-        .with_context(|| format!("Failed to open SQLite database at {:?}", db_path))?;
+        .with_context(|| format!("Failed to open SQLite at {:?}", db_path))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "OFF")?;
     conn.pragma_update(None, "cache_size", "-64000")?;
@@ -54,13 +47,75 @@ fn open_tree_db(root: &Path) -> Result<Connection> {
     conn.pragma_update(None, "page_size", "4096")?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS tree_entries (
-            path TEXT PRIMARY KEY,
-            object_id BLOB NOT NULL,
-            kind INTEGER NOT NULL,
-            mode INTEGER NOT NULL
+            path TEXT PRIMARY KEY, object_id BLOB NOT NULL, kind INTEGER NOT NULL, mode INTEGER NOT NULL
+        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS pending_changes (
+            path TEXT PRIMARY KEY, change_type INTEGER NOT NULL, object_id BLOB, kind INTEGER, mode INTEGER
         ) WITHOUT ROWID;"
     )?;
     Ok(conn)
+}
+
+fn conn_tree_insert(c: &Connection, path: &str, oid: &ObjectId, kind: ObjectKind, mode: u32) -> Result<()> {
+    c.execute("INSERT INTO tree_entries (path,object_id,kind,mode) VALUES (?1,?2,?3,?4) ON CONFLICT(path) DO UPDATE SET object_id=excluded.object_id,kind=excluded.kind,mode=excluded.mode",
+        rusqlite::params![path, oid.as_bytes().as_slice(), kind_to_i64(kind), mode as i64])?;
+    c.execute("INSERT INTO pending_changes (path,change_type,object_id,kind,mode) VALUES (?1,0,?2,?3,?4) ON CONFLICT(path) DO UPDATE SET change_type=0,object_id=excluded.object_id,kind=excluded.kind,mode=excluded.mode",
+        rusqlite::params![path, oid.as_bytes().as_slice(), kind_to_i64(kind), mode as i64])?;
+    Ok(())
+}
+
+fn conn_tree_remove(c: &Connection, path: &str) -> Result<()> {
+    c.execute("DELETE FROM tree_entries WHERE path=?1", rusqlite::params![path])?;
+    c.execute("DELETE FROM tree_entries WHERE path LIKE ?1", rusqlite::params![format!("{}/%", path)])?;
+    c.execute("INSERT INTO pending_changes (path,change_type,object_id,kind,mode) VALUES (?1,1,NULL,NULL,NULL) ON CONFLICT(path) DO UPDATE SET change_type=1,object_id=NULL,kind=NULL,mode=NULL",
+        rusqlite::params![path])?;
+    Ok(())
+}
+
+fn conn_build_tree(c: &Connection) -> Result<Tree> {
+    let mut tree = Tree::new();
+    let mut stmt = c.prepare_cached("SELECT path,object_id,kind,mode FROM tree_entries ORDER BY path")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        tree.insert(TreeEntry::new(row.get::<_,String>(0)?, bytes_to_oid(&row.get::<_,Vec<u8>>(1)?), i64_to_kind(row.get(2)?), row.get::<_,i64>(3)? as u32));
+    }
+    Ok(tree)
+}
+
+fn conn_collect_pending(c: &Connection) -> Result<(Vec<TreeChange>, usize)> {
+    let mut changes = Vec::new();
+    {
+        let mut stmt = c.prepare_cached("SELECT path,change_type,object_id,kind,mode FROM pending_changes ORDER BY path")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let path: String = row.get(0)?;
+            let ct: i64 = row.get(1)?;
+            if ct == 1 {
+                changes.push(TreeChange::Delete { path });
+            } else {
+                changes.push(TreeChange::Upsert {
+                    path: path.clone(),
+                    entry: TreeEntry::new(path, bytes_to_oid(&row.get::<_,Vec<u8>>(2)?), i64_to_kind(row.get(3)?), row.get::<_,i64>(4)? as u32),
+                });
+            }
+        }
+    }
+    let total: i64 = c.query_row("SELECT COUNT(*) FROM tree_entries", [], |r| r.get(0))?;
+    c.execute("DELETE FROM pending_changes", [])?;
+    Ok((changes, total as usize))
+}
+
+fn conn_populate(c: &Connection, tree: &Tree) -> Result<()> {
+    c.execute("DELETE FROM tree_entries", [])?;
+    for e in tree.iter() {
+        c.execute("INSERT INTO tree_entries (path,object_id,kind,mode) VALUES (?1,?2,?3,?4)",
+            rusqlite::params![e.name, e.id.as_bytes().as_slice(), kind_to_i64(e.kind), e.mode as i64])?;
+    }
+    Ok(())
+}
+
+fn conn_count(c: &Connection) -> Result<i64> {
+    Ok(c.query_row("SELECT COUNT(*) FROM tree_entries", [], |r| r.get(0))?)
 }
 
 pub struct SqlitePropertyStore {
@@ -69,54 +124,31 @@ pub struct SqlitePropertyStore {
 }
 
 impl SqlitePropertyStore {
-    fn new(root: PathBuf) -> Self {
-        Self { root, cache: RwLock::new(HashMap::new()) }
-    }
+    fn new(root: PathBuf) -> Self { Self { root, cache: RwLock::new(HashMap::new()) } }
     fn props_dir(&self) -> PathBuf { self.root.join("props") }
-    fn path_hash(path: &str) -> String {
-        use sha2::{Digest, Sha256};
-        hex::encode(Sha256::digest(path.as_bytes()))
-    }
-    fn prop_file(&self, path: &str) -> PathBuf {
-        self.props_dir().join(format!("{}.json", Self::path_hash(path)))
-    }
+    fn path_hash(path: &str) -> String { use sha2::{Digest, Sha256}; hex::encode(Sha256::digest(path.as_bytes())) }
+    fn prop_file(&self, path: &str) -> PathBuf { self.props_dir().join(format!("{}.json", Self::path_hash(path))) }
     pub async fn get(&self, path: &str) -> PropertySet {
         { let c = self.cache.read().await; if let Some(ps) = c.get(path) { return ps.clone(); } }
         let fp = self.prop_file(path);
-        if fp.exists() {
-            if let Ok(data) = fs::read_to_string(&fp) {
-                if let Ok(ps) = serde_json::from_str::<PropertySet>(&data) {
-                    self.cache.write().await.insert(path.to_string(), ps.clone());
-                    return ps;
-                }
-            }
-        }
+        if fp.exists() { if let Ok(data) = fs::read_to_string(&fp) { if let Ok(ps) = serde_json::from_str::<PropertySet>(&data) { self.cache.write().await.insert(path.to_string(), ps.clone()); return ps; } } }
         PropertySet::new()
     }
     pub async fn set(&self, path: String, name: String, value: String) -> Result<()> {
         let mut cache = self.cache.write().await;
         let ps = cache.entry(path.clone()).or_insert_with(PropertySet::new);
         ps.set(name, value);
-        let fp = self.prop_file(&path);
-        fs::create_dir_all(fp.parent().unwrap())?;
-        fs::write(&fp, serde_json::to_string(ps)?)?;
-        Ok(())
+        let fp = self.prop_file(&path); fs::create_dir_all(fp.parent().unwrap())?;
+        fs::write(&fp, serde_json::to_string(ps)?)?; Ok(())
     }
     pub async fn remove(&self, path: &str, name: &str) -> Result<Option<String>> {
         let mut cache = self.cache.write().await;
-        if let Some(ps) = cache.get_mut(path) {
-            let val = ps.remove(name);
-            let fp = self.prop_file(path);
-            fs::create_dir_all(fp.parent().unwrap())?;
-            fs::write(&fp, serde_json::to_string(ps)?)?;
-            Ok(val)
-        } else { Ok(None) }
+        if let Some(ps) = cache.get_mut(path) { let v = ps.remove(name); let fp = self.prop_file(path); fs::create_dir_all(fp.parent().unwrap())?; fs::write(&fp, serde_json::to_string(ps)?)?; Ok(v) } else { Ok(None) }
     }
     pub async fn list(&self, path: &str) -> Vec<String> { self.get(path).await.list() }
     pub async fn contains(&self, path: &str, name: &str) -> bool { self.get(path).await.contains(name) }
 }
 
-/// SQLite-backed disk repository
 pub struct SqliteRepository {
     root: PathBuf,
     uuid: String,
@@ -124,73 +156,18 @@ pub struct SqliteRepository {
     tree_conn: Mutex<Connection>,
     property_store: Arc<SqlitePropertyStore>,
     batch_mode: std::sync::atomic::AtomicBool,
-}
-
-fn conn_tree_insert(conn: &Connection, path: &str, oid: &ObjectId, kind: ObjectKind, mode: u32) -> Result<()> {
-    conn.execute(
-        "INSERT INTO tree_entries (path,object_id,kind,mode) VALUES (?1,?2,?3,?4) \
-         ON CONFLICT(path) DO UPDATE SET object_id=excluded.object_id,kind=excluded.kind,mode=excluded.mode",
-        rusqlite::params![path, oid.as_bytes().as_slice(), kind_to_i64(kind), mode as i64],
-    )?;
-    Ok(())
-}
-
-fn conn_tree_remove(conn: &Connection, path: &str) -> Result<()> {
-    conn.execute("DELETE FROM tree_entries WHERE path=?1", rusqlite::params![path])?;
-    Ok(())
-}
-
-fn conn_build_tree(conn: &Connection) -> Result<Tree> {
-    let mut tree = Tree::new();
-    let mut stmt = conn.prepare_cached("SELECT path,object_id,kind,mode FROM tree_entries ORDER BY path")?;
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        let p: String = row.get(0)?;
-        let ob: Vec<u8> = row.get(1)?;
-        let ki: i64 = row.get(2)?;
-        let mo: i64 = row.get(3)?;
-        tree.insert(TreeEntry::new(p, bytes_to_oid(&ob), i64_to_kind(ki), mo as u32));
-    }
-    Ok(tree)
-}
-
-fn conn_populate(conn: &Connection, tree: &Tree) -> Result<()> {
-    conn.execute("DELETE FROM tree_entries", [])?;
-    for e in tree.iter() {
-        conn.execute(
-            "INSERT INTO tree_entries (path,object_id,kind,mode) VALUES (?1,?2,?3,?4)",
-            rusqlite::params![e.name, e.id.as_bytes().as_slice(), kind_to_i64(e.kind), e.mode as i64],
-        )?;
-    }
-    Ok(())
-}
-
-fn conn_count(conn: &Connection) -> Result<i64> {
-    Ok(conn.query_row("SELECT COUNT(*) FROM tree_entries", [], |r| r.get(0))?)
+    tree_cache: Mutex<LruCache<u64, HashMap<String, TreeEntry>>>,
 }
 
 impl SqliteRepository {
     pub fn open(path: &Path) -> Result<Self> {
         let root = path.to_path_buf();
-        fs::create_dir_all(root.join("objects"))?;
-        fs::create_dir_all(root.join("commits"))?;
-        fs::create_dir_all(root.join("trees"))?;
-        fs::create_dir_all(root.join("props"))?;
-        fs::create_dir_all(root.join("refs"))?;
-
+        for d in &["objects","commits","trees","tree_deltas","props","refs"] { fs::create_dir_all(root.join(d))?; }
         let uuid_path = root.join("uuid");
-        let uuid = if uuid_path.exists() {
-            fs::read_to_string(&uuid_path)?.trim().to_string()
-        } else {
-            let u = uuid::Uuid::new_v4().to_string();
-            fs::write(&uuid_path, &u)?; u
-        };
-
+        let uuid = if uuid_path.exists() { fs::read_to_string(&uuid_path)?.trim().to_string() }
+            else { let u = uuid::Uuid::new_v4().to_string(); fs::write(&uuid_path, &u)?; u };
         let head_path = root.join("refs").join("head");
-        let current_rev = if head_path.exists() {
-            fs::read_to_string(&head_path)?.trim().parse::<u64>().unwrap_or(0)
-        } else { 0 };
-
+        let current_rev = if head_path.exists() { fs::read_to_string(&head_path)?.trim().parse::<u64>().unwrap_or(0) } else { 0 };
         let tree_conn = open_tree_db(&root)?;
 
         // Migration: sled -> SQLite
@@ -199,27 +176,21 @@ impl SqliteRepository {
             let count: i64 = tree_conn.query_row("SELECT COUNT(*) FROM tree_entries", [], |r| r.get(0))?;
             if count == 0 {
                 if let Ok(sled_db) = sled::open(&sled_db_path) {
-                    let mut migrated = 0u64;
                     tree_conn.execute_batch("BEGIN")?;
                     for item in sled_db.iter() {
                         if let Ok((key, value)) = item {
                             if let Ok(ps) = String::from_utf8(key.to_vec()) {
                                 if let Ok(rec) = bincode::deserialize::<SledTreeEntryRecord>(&value) {
-                                    let _ = tree_conn.execute(
-                                        "INSERT OR REPLACE INTO tree_entries (path,object_id,kind,mode) VALUES (?1,?2,?3,?4)",
-                                        rusqlite::params![ps, rec.object_id.as_bytes().as_slice(), kind_to_i64(rec.kind), rec.mode as i64],
-                                    );
-                                    migrated += 1;
+                                    let _ = tree_conn.execute("INSERT OR REPLACE INTO tree_entries (path,object_id,kind,mode) VALUES (?1,?2,?3,?4)",
+                                        rusqlite::params![ps, rec.object_id.as_bytes().as_slice(), kind_to_i64(rec.kind), rec.mode as i64]);
                                 }
                             }
                         }
                     }
                     tree_conn.execute_batch("COMMIT")?;
-                    if migrated > 0 { tracing::info!("Migrated {} entries from sled to SQLite", migrated); }
                 }
             }
         }
-
         // Migration: root_tree.bin -> SQLite
         let rtp = root.join("root_tree.bin");
         if rtp.exists() {
@@ -229,27 +200,22 @@ impl SqliteRepository {
                     if let Ok(old_tree) = bincode::deserialize::<Tree>(&data) {
                         tree_conn.execute_batch("BEGIN")?;
                         for e in old_tree.iter() {
-                            let _ = tree_conn.execute(
-                                "INSERT OR REPLACE INTO tree_entries (path,object_id,kind,mode) VALUES (?1,?2,?3,?4)",
-                                rusqlite::params![e.name, e.id.as_bytes().as_slice(), kind_to_i64(e.kind), e.mode as i64],
-                            );
+                            let _ = tree_conn.execute("INSERT OR REPLACE INTO tree_entries (path,object_id,kind,mode) VALUES (?1,?2,?3,?4)",
+                                rusqlite::params![e.name, e.id.as_bytes().as_slice(), kind_to_i64(e.kind), e.mode as i64]);
                         }
                         tree_conn.execute_batch("COMMIT")?;
                         let _ = fs::remove_file(&rtp);
-                        tracing::info!("Migrated root_tree.bin to SQLite ({} entries)", old_tree.entries.len());
                     }
                 }
             }
         }
 
-        let property_store = Arc::new(SqlitePropertyStore::new(root.clone()));
-
         Ok(Self {
-            root, uuid,
-            current_rev: Arc::new(RwLock::new(current_rev)),
+            root: root.clone(), uuid, current_rev: Arc::new(RwLock::new(current_rev)),
             tree_conn: Mutex::new(tree_conn),
-            property_store,
+            property_store: Arc::new(SqlitePropertyStore::new(root)),
             batch_mode: std::sync::atomic::AtomicBool::new(false),
+            tree_cache: Mutex::new(LruCache::new(NonZeroUsize::new(TREE_CACHE_CAPACITY).unwrap())),
         })
     }
 
@@ -258,46 +224,80 @@ impl SqliteRepository {
     pub fn property_store(&self) -> &Arc<SqlitePropertyStore> { &self.property_store }
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> { self.tree_conn.lock().unwrap() }
 
-    fn object_path(&self, id: &ObjectId) -> PathBuf {
-        let hex = id.to_hex();
-        self.root.join("objects").join(&hex[..2]).join(&hex[2..])
-    }
+    fn object_path(&self, id: &ObjectId) -> PathBuf { let h = id.to_hex(); self.root.join("objects").join(&h[..2]).join(&h[2..]) }
     fn store_object(&self, id: &ObjectId, data: &[u8]) -> Result<()> {
-        let p = self.object_path(id);
-        if p.exists() { return Ok(()); }
-        fs::create_dir_all(p.parent().unwrap())?;
-        let tmp = p.with_extension("tmp");
-        fs::write(&tmp, data)?;
-        fs::rename(&tmp, &p)?;
-        Ok(())
+        let p = self.object_path(id); if p.exists() { return Ok(()); }
+        fs::create_dir_all(p.parent().unwrap())?; let tmp = p.with_extension("tmp"); fs::write(&tmp, data)?; fs::rename(&tmp, &p)?; Ok(())
     }
-    fn load_object(&self, id: &ObjectId) -> Result<Vec<u8>> {
-        let p = self.object_path(id);
-        fs::read(&p).with_context(|| format!("Object {} not found at {:?}", id, p))
-    }
+    fn load_object(&self, id: &ObjectId) -> Result<Vec<u8>> { let p = self.object_path(id); fs::read(&p).with_context(|| format!("Object {} not found", id)) }
 
     fn commit_path(&self, rev: u64) -> PathBuf { self.root.join("commits").join(format!("{}.bin", rev)) }
-    fn store_commit(&self, rev: u64, commit: &Commit) -> Result<()> {
-        fs::write(self.commit_path(rev), bincode::serialize(commit)?)?; Ok(())
-    }
-    fn load_commit(&self, rev: u64) -> Result<Commit> {
-        let p = self.commit_path(rev);
-        Ok(bincode::deserialize(&fs::read(&p).with_context(|| format!("Commit r{} not found", rev))?)?)
-    }
+    fn store_commit(&self, rev: u64, c: &Commit) -> Result<()> { fs::write(self.commit_path(rev), bincode::serialize(c)?)?; Ok(()) }
+    fn load_commit(&self, rev: u64) -> Result<Commit> { Ok(bincode::deserialize(&fs::read(self.commit_path(rev)).with_context(|| format!("Commit r{} not found", rev))?)?) }
 
     fn tree_snapshot_path(&self, rev: u64) -> PathBuf { self.root.join("trees").join(format!("{}.bin", rev)) }
-    fn store_tree_snapshot(&self, rev: u64, tree: &Tree) -> Result<()> {
-        fs::write(self.tree_snapshot_path(rev), bincode::serialize(tree)?)?; Ok(())
-    }
-    fn load_tree_snapshot(&self, rev: u64) -> Result<Tree> {
-        let p = self.tree_snapshot_path(rev);
-        Ok(bincode::deserialize(&fs::read(&p).with_context(|| format!("Tree r{} not found", rev))?)?)
-    }
-    fn save_head(&self, rev: u64) -> Result<()> {
-        fs::write(self.root.join("refs").join("head"), rev.to_string())?; Ok(())
+    fn store_tree_snapshot(&self, rev: u64, t: &Tree) -> Result<()> { fs::write(self.tree_snapshot_path(rev), bincode::serialize(t)?)?; Ok(()) }
+    fn load_tree_snapshot(&self, rev: u64) -> Result<Tree> { Ok(bincode::deserialize(&fs::read(self.tree_snapshot_path(rev)).with_context(|| format!("Tree r{} not found", rev))?)?) }
+    fn has_tree_snapshot(&self, rev: u64) -> bool { self.tree_snapshot_path(rev).exists() }
+
+    fn delta_tree_path(&self, rev: u64) -> PathBuf { self.root.join("tree_deltas").join(format!("{}.bin", rev)) }
+    fn store_delta_tree(&self, rev: u64, d: &DeltaTree) -> Result<()> { fs::write(self.delta_tree_path(rev), bincode::serialize(d)?)?; Ok(()) }
+    fn load_delta_tree(&self, rev: u64) -> Result<DeltaTree> { Ok(bincode::deserialize(&fs::read(self.delta_tree_path(rev)).with_context(|| format!("Delta r{} not found", rev))?)?) }
+    fn has_delta_tree(&self, rev: u64) -> bool { self.delta_tree_path(rev).exists() }
+
+    fn save_head(&self, rev: u64) -> Result<()> { fs::write(self.root.join("refs").join("head"), rev.to_string())?; Ok(()) }
+
+    /// Reconstruct the full tree at a given revision via delta chain + cache + snapshots.
+    pub fn get_tree_at_rev(&self, rev: u64) -> Result<HashMap<String, TreeEntry>> {
+        if rev == 0 { return Ok(HashMap::new()); }
+        { let mut c = self.tree_cache.lock().unwrap(); if let Some(t) = c.get(&rev) { return Ok(t.clone()); } }
+        if self.has_tree_snapshot(rev) {
+            let m = tree_to_map(&self.load_tree_snapshot(rev)?);
+            self.tree_cache.lock().unwrap().put(rev, m.clone()); return Ok(m);
+        }
+        // Collect delta chain
+        let mut chain: Vec<(u64, DeltaTree)> = Vec::new();
+        let mut cur = rev;
+        loop {
+            if cur == 0 { break; }
+            { let mut c = self.tree_cache.lock().unwrap(); if c.get(&cur).is_some() { break; } }
+            if self.has_tree_snapshot(cur) { break; }
+            if self.has_delta_tree(cur) {
+                let d = self.load_delta_tree(cur)?; let p = d.parent_rev; chain.push((cur, d)); cur = p;
+            } else {
+                // Legacy: full tree in objects
+                return self.get_tree_at_rev_legacy(rev);
+            }
+        }
+        // Base tree
+        let mut tree = if cur == 0 { HashMap::new() } else {
+            let cached = { self.tree_cache.lock().unwrap().get(&cur).cloned() };
+            if let Some(t) = cached { t }
+            else if self.has_tree_snapshot(cur) {
+                let m = tree_to_map(&self.load_tree_snapshot(cur)?);
+                self.tree_cache.lock().unwrap().put(cur, m.clone()); m
+            } else { return Err(anyhow!("No base tree for rev {}", cur)); }
+        };
+        // Apply deltas oldest-first
+        for (dr, delta) in chain.into_iter().rev() {
+            for ch in &delta.changes {
+                match ch {
+                    TreeChange::Upsert { path, entry } => { tree.insert(path.clone(), entry.clone()); }
+                    TreeChange::Delete { path } => { tree.remove(path); let pfx = format!("{}/", path); tree.retain(|k,_| !k.starts_with(&pfx)); }
+                }
+            }
+            self.tree_cache.lock().unwrap().put(dr, tree.clone());
+        }
+        Ok(tree)
     }
 
-    // ==================== Public API ====================
+    fn get_tree_at_rev_legacy(&self, rev: u64) -> Result<HashMap<String, TreeEntry>> {
+        let c = self.load_commit(rev)?;
+        let t: Tree = bincode::deserialize(&self.load_object(&c.tree_id)?)?;
+        let m = tree_to_map(&t);
+        self.tree_cache.lock().unwrap().put(rev, m.clone());
+        Ok(m)
+    }
 
     pub async fn initialize(&self) -> Result<()> {
         let head_path = self.root.join("refs").join("head");
@@ -306,57 +306,52 @@ impl SqliteRepository {
             *self.current_rev.write().await = rev;
             let c = self.conn();
             if conn_count(&c)? == 0 {
-                if let Ok(tree) = self.load_tree_snapshot(rev) { conn_populate(&c, &tree)?; }
+                drop(c);
+                if let Ok(tm) = self.get_tree_at_rev(rev) { conn_populate(&self.conn(), &map_to_tree(&tm))?; }
+                else if let Ok(t) = self.load_tree_snapshot(rev) { conn_populate(&self.conn(), &t)?; }
             }
             return Ok(());
         }
-        let tree = Tree::new();
-        let tree_id = tree.id();
-        self.store_object(&tree_id, &tree.to_bytes()?)?;
-        let commit = Commit::new(tree_id, vec![], "system".into(), "Initial commit".into(), chrono::Utc::now().timestamp(), 0);
+        let tree = Tree::new(); let tid = tree.id();
+        self.store_object(&tid, &tree.to_bytes()?)?;
+        let commit = Commit::new(tid, vec![], "system".into(), "Initial commit".into(), chrono::Utc::now().timestamp(), 0);
         self.store_object(&commit.id(), &commit.to_bytes()?)?;
         self.store_commit(0, &commit)?;
         self.store_tree_snapshot(0, &tree)?;
+        self.store_delta_tree(0, &DeltaTree::new(0, vec![], 0))?;
         self.save_head(0)?;
-        self.conn().execute("DELETE FROM tree_entries", [])?;
+        { let c = self.conn(); c.execute("DELETE FROM tree_entries", [])?; c.execute("DELETE FROM pending_changes", [])?; }
         Ok(())
     }
 
     pub async fn get_file(&self, path: &str, rev: u64) -> Result<Bytes> {
-        let commit = self.load_commit(rev)?;
-        let tree: Tree = bincode::deserialize(&self.load_object(&commit.tree_id)?)?;
-        let full_path = path.trim_start_matches('/');
-        if let Some(entry) = tree.get(full_path) {
-            if entry.kind == ObjectKind::Blob {
-                return Ok(Bytes::from(Blob::deserialize(&self.load_object(&entry.id)?)?.data));
+        let fp = path.trim_start_matches('/');
+        let tm = self.get_tree_at_rev(rev)?;
+        if let Some(e) = tm.get(fp) {
+            if e.kind == ObjectKind::Blob {
+                return Ok(Bytes::from(Blob::deserialize(&self.load_object(&e.id)?)?.data));
             }
-        }
-        let parts: Vec<&str> = full_path.split('/').filter(|p| !p.is_empty()).collect();
-        let mut ct = tree;
-        for (i, part) in parts.iter().enumerate() {
-            if let Some(entry) = ct.get(*part) {
-                if i == parts.len() - 1 {
-                    return Ok(Bytes::from(Blob::deserialize(&self.load_object(&entry.id)?)?.data));
-                }
-                ct = bincode::deserialize(&self.load_object(&entry.id)?)?;
-            } else { return Err(anyhow!("Path not found: {}", path)); }
         }
         Err(anyhow!("Path not found: {}", path))
     }
 
     pub async fn list_dir(&self, path: &str, rev: u64) -> Result<Vec<String>> {
-        let commit = self.load_commit(rev)?;
-        let mut ct: Tree = bincode::deserialize(&self.load_object(&commit.tree_id)?)?;
-        for part in path.trim_start_matches('/').split('/').filter(|p| !p.is_empty()) {
-            if let Some(e) = ct.get(part) { ct = bincode::deserialize(&self.load_object(&e.id)?)?; }
-            else { return Err(anyhow!("Directory not found: {}", path)); }
-        }
-        Ok(ct.iter().map(|e| e.name.clone()).collect())
+        let tm = self.get_tree_at_rev(rev)?;
+        let pfx = path.trim_start_matches('/').trim_end_matches('/');
+        let dir_pfx = if pfx.is_empty() { String::new() } else { format!("{}/", pfx) };
+        let mut names: Vec<String> = tm.keys()
+            .filter_map(|k| {
+                if pfx.is_empty() { k.split('/').next().map(|s| s.to_string()) }
+                else { k.strip_prefix(&dir_pfx).and_then(|r| r.split('/').next()).map(|s| s.to_string()) }
+            })
+            .collect::<std::collections::HashSet<_>>().into_iter().collect();
+        names.sort();
+        if names.is_empty() && !pfx.is_empty() { return Err(anyhow!("Directory not found: {}", path)); }
+        Ok(names)
     }
 
     pub async fn add_file(&self, path: &str, content: Vec<u8>, executable: bool) -> Result<ObjectId> {
-        let blob = Blob::new(content, executable);
-        let bid = blob.id();
+        let blob = Blob::new(content, executable); let bid = blob.id();
         self.store_object(&bid, &blob.to_bytes()?)?;
         conn_tree_insert(&self.conn(), path.trim_start_matches('/'), &bid, ObjectKind::Blob, if executable { 0o755 } else { 0o644 })?;
         Ok(bid)
@@ -374,18 +369,35 @@ impl SqliteRepository {
     }
 
     pub async fn commit(&self, author: String, message: String, timestamp: i64) -> Result<u64> {
-        let root_tree = conn_build_tree(&self.conn())?;
+        let cr = *self.current_rev.read().await;
+        let nr = cr + 1;
+        let parent_rev = if nr > 1 { nr - 1 } else { 0 };
+        let c = self.conn();
+
+        // Collect pending changes -> DeltaTree
+        let (changes, total_entries) = conn_collect_pending(&c)?;
+        let delta = DeltaTree::new(parent_rev, changes, total_entries);
+
+        // Still build full Tree for commit's tree_id (backward compat)
+        let root_tree = conn_build_tree(&c)?;
         let tree_id = root_tree.id();
         self.store_object(&tree_id, &root_tree.to_bytes()?)?;
-        let cr = *self.current_rev.read().await;
+
         let parents = if cr > 0 || self.commit_path(cr).exists() {
-            self.load_commit(cr).map(|c| vec![c.id()]).unwrap_or_default()
+            self.load_commit(cr).map(|cc| vec![cc.id()]).unwrap_or_default()
         } else { vec![] };
         let commit = Commit::new(tree_id, parents, author, message, timestamp, 0);
         self.store_object(&commit.id(), &commit.to_bytes()?)?;
-        let nr = cr + 1;
         self.store_commit(nr, &commit)?;
-        self.store_tree_snapshot(nr, &root_tree)?;
+
+        // Store delta tree
+        self.store_delta_tree(nr, &delta)?;
+
+        // Periodic full snapshot
+        if nr % SNAPSHOT_INTERVAL == 0 {
+            self.store_tree_snapshot(nr, &root_tree)?;
+        }
+
         self.save_head(nr)?;
         *self.current_rev.write().await = nr;
         Ok(nr)
@@ -403,8 +415,7 @@ impl SqliteRepository {
     }
 
     pub fn add_file_sync(&self, path: &str, content: Vec<u8>, executable: bool) -> Result<ObjectId> {
-        let blob = Blob::new(content, executable);
-        let bid = blob.id();
+        let blob = Blob::new(content, executable); let bid = blob.id();
         self.store_object(&bid, &blob.to_bytes()?)?;
         conn_tree_insert(&self.conn(), path.trim_start_matches('/'), &bid, ObjectKind::Blob, if executable { 0o755 } else { 0o644 })?;
         Ok(bid)
@@ -421,19 +432,43 @@ impl SqliteRepository {
         conn_tree_remove(&self.conn(), path.trim_start_matches('/'))?; Ok(())
     }
 
+    /// Optimized sync commit: stores DeltaTree instead of full tree snapshot.
+    /// Only builds full Tree for periodic snapshots (every SNAPSHOT_INTERVAL revisions).
     pub fn commit_sync(&self, author: String, message: String, timestamp: i64) -> Result<u64> {
-        let root_tree = conn_build_tree(&self.conn())?;
-        let tree_id = root_tree.id();
-        self.store_object(&tree_id, &root_tree.to_bytes()?)?;
         let cr = *self.current_rev.blocking_read();
+        let nr = cr + 1;
+        let parent_rev = if nr > 1 { nr - 1 } else { 0 };
+        let c = self.conn();
+
+        // Collect pending changes -> DeltaTree (O(changes) not O(total_files))
+        let (changes, total_entries) = conn_collect_pending(&c)?;
+        let delta = DeltaTree::new(parent_rev, changes, total_entries);
+
+        // Only build the full tree when we need a periodic snapshot
+        let need_snapshot = nr % SNAPSHOT_INTERVAL == 0;
+
+        let tree_id = if need_snapshot {
+            let root_tree = conn_build_tree(&c)?;
+            let tid = root_tree.id();
+            self.store_object(&tid, &root_tree.to_bytes()?)?;
+            self.store_tree_snapshot(nr, &root_tree)?;
+            tid
+        } else {
+            // Compute a lightweight tree_id from the delta hash for the commit object.
+            // We don't need the actual Tree object unless someone requests it via legacy path.
+            delta.id()
+        };
+
         let parents = if cr > 0 || self.commit_path(cr).exists() {
-            self.load_commit(cr).map(|c| vec![c.id()]).unwrap_or_default()
+            self.load_commit(cr).map(|cc| vec![cc.id()]).unwrap_or_default()
         } else { vec![] };
         let commit = Commit::new(tree_id, parents, author, message, timestamp, 0);
         self.store_object(&commit.id(), &commit.to_bytes()?)?;
-        let nr = cr + 1;
         self.store_commit(nr, &commit)?;
-        self.store_tree_snapshot(nr, &root_tree)?;
+
+        // Store delta tree (always)
+        self.store_delta_tree(nr, &delta)?;
+
         self.save_head(nr)?;
         *self.current_rev.blocking_write() = nr;
         Ok(nr)
@@ -538,5 +573,102 @@ mod tests {
             repo.commit("bot".into(), format!("commit {}", i), i as i64).await.unwrap();
         }
         assert_eq!(repo.current_rev().await, 50);
+    }
+
+    #[tokio::test]
+    async fn test_delta_tree_reconstruction() {
+        let tmp = TempDir::new().unwrap();
+        let repo = SqliteRepository::open(tmp.path()).unwrap();
+        repo.initialize().await.unwrap();
+
+        // Create 3 commits with different files
+        repo.add_file("/a.txt", b"aaa".to_vec(), false).await.unwrap();
+        repo.commit("user".into(), "add a".into(), 100).await.unwrap();
+
+        repo.add_file("/b.txt", b"bbb".to_vec(), false).await.unwrap();
+        repo.commit("user".into(), "add b".into(), 200).await.unwrap();
+
+        repo.add_file("/c.txt", b"ccc".to_vec(), false).await.unwrap();
+        repo.commit("user".into(), "add c".into(), 300).await.unwrap();
+
+        // Check tree at each revision
+        let t1 = repo.get_tree_at_rev(1).unwrap();
+        assert_eq!(t1.len(), 1);
+        assert!(t1.contains_key("a.txt"));
+
+        let t2 = repo.get_tree_at_rev(2).unwrap();
+        assert_eq!(t2.len(), 2);
+        assert!(t2.contains_key("a.txt"));
+        assert!(t2.contains_key("b.txt"));
+
+        let t3 = repo.get_tree_at_rev(3).unwrap();
+        assert_eq!(t3.len(), 3);
+        assert!(t3.contains_key("a.txt"));
+        assert!(t3.contains_key("b.txt"));
+        assert!(t3.contains_key("c.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_delta_tree_with_deletes() {
+        let tmp = TempDir::new().unwrap();
+        let repo = SqliteRepository::open(tmp.path()).unwrap();
+        repo.initialize().await.unwrap();
+
+        repo.add_file("/a.txt", b"aaa".to_vec(), false).await.unwrap();
+        repo.add_file("/b.txt", b"bbb".to_vec(), false).await.unwrap();
+        repo.commit("user".into(), "add a+b".into(), 100).await.unwrap();
+
+        repo.delete_file("/a.txt").await.unwrap();
+        repo.commit("user".into(), "del a".into(), 200).await.unwrap();
+
+        let t1 = repo.get_tree_at_rev(1).unwrap();
+        assert_eq!(t1.len(), 2);
+
+        let t2 = repo.get_tree_at_rev(2).unwrap();
+        assert_eq!(t2.len(), 1);
+        assert!(t2.contains_key("b.txt"));
+        assert!(!t2.contains_key("a.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_delta_tree_batch_commit_sync() {
+        let tmp = TempDir::new().unwrap();
+        let repo = SqliteRepository::open(tmp.path()).unwrap();
+        repo.initialize().await.unwrap();
+
+        // Simulate multi-commit batch import
+        repo.begin_batch();
+        repo.add_file_sync("file1.txt", b"content1".to_vec(), false).unwrap();
+        repo.commit_sync("bot".into(), "commit 1".into(), 100).unwrap();
+
+        repo.add_file_sync("file2.txt", b"content2".to_vec(), false).unwrap();
+        repo.commit_sync("bot".into(), "commit 2".into(), 200).unwrap();
+
+        repo.delete_file_sync("file1.txt").unwrap();
+        repo.commit_sync("bot".into(), "commit 3".into(), 300).unwrap();
+        repo.end_batch();
+
+        // Verify delta reconstruction
+        let t1 = repo.get_tree_at_rev(1).unwrap();
+        assert_eq!(t1.len(), 1);
+        assert!(t1.contains_key("file1.txt"));
+
+        let t2 = repo.get_tree_at_rev(2).unwrap();
+        assert_eq!(t2.len(), 2);
+
+        let t3 = repo.get_tree_at_rev(3).unwrap();
+        assert_eq!(t3.len(), 1);
+        assert!(t3.contains_key("file2.txt"));
+        assert!(!t3.contains_key("file1.txt"));
+
+        // Verify no full tree snapshots were written (except rev 0)
+        assert!(!repo.has_tree_snapshot(1));
+        assert!(!repo.has_tree_snapshot(2));
+        assert!(!repo.has_tree_snapshot(3));
+
+        // Verify delta trees exist
+        assert!(repo.has_delta_tree(1));
+        assert!(repo.has_delta_tree(2));
+        assert!(repo.has_delta_tree(3));
     }
 }
