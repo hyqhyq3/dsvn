@@ -1,0 +1,47 @@
+[package]
+name = "dsvnsync-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "dsvnsync"
+path = "src/main.rs"
+
+[dependencies]
+# Core
+dsvn-core = { path = "../dsvn-core" }
+
+# Async
+tokio = { workspace = true }
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+
+# Compression
+zstd = { workspace = true }
+
+# Cryptography
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Utilities
+bytes = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.13"

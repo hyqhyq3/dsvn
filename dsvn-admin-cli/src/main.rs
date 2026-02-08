@@ -113,6 +113,17 @@ enum Commands {
         #[arg(short, long)]
         name: String,
     },
+
+    /// Export replication log for a revision range
+    #[command(name = "repl-log")]
+    ReplLog {
+        #[arg(short, long)]
+        repo: String,
+        #[arg(long)]
+        from: Option<u64>,
+        #[arg(long)]
+        to: Option<u64>,
+    },
 }
 
 // ─── Helpers ────────────────────────────────────────────────
@@ -639,6 +650,65 @@ async fn main() -> Result<()> {
 
         Commands::DelRevProp { repo, revision, name } => {
             cmd_delrevprop(repo, revision, name).await
+        }
+
+        Commands::ReplLog { repo, from, to } => {
+            let rp = Path::new(&repo);
+            if !rp.join("uuid").exists() { return Err(anyhow!("Not a valid dsvn repository: {}", repo)); }
+            let repository = SqliteRepository::open(rp)?;
+            repository.initialize().await?;
+            let head = repository.current_rev().await;
+
+            let from_rev = from.unwrap_or(0);
+            let to_rev = to.unwrap_or(head);
+
+            println!("Replication log for: {}", repo);
+            println!("  Revision range: r{} to r{}", from_rev, to_rev);
+            println!();
+
+            // Check for native dsvn replication log
+            let repl_log = dsvn_core::ReplicationLog::new(rp);
+            let entries = repl_log.query(from_rev, to_rev)?;
+
+            if entries.is_empty() {
+                // No native repl log — generate from commits/deltas
+                println!("No native replication log entries found.");
+                println!("Generating from commit history:\n");
+                for rev in from_rev..=to_rev.min(head) {
+                    if let Some(commit) = repository.get_commit(rev).await {
+                        let date = chrono::DateTime::from_timestamp(commit.timestamp, 0)
+                            .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S.000000Z").to_string())
+                            .unwrap_or_default();
+                        println!("r{:<6} | {:<20} | {} | {}",
+                            rev, commit.author,
+                            &date[..19],
+                            if commit.message.len() > 60 { format!("{}...", &commit.message[..57]) } else { commit.message.clone() }
+                        );
+                    }
+                }
+            } else {
+                println!("Found {} replication log entries:\n", entries.len());
+                for entry in &entries {
+                    let date = chrono::DateTime::from_timestamp(entry.timestamp, 0)
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                        .unwrap_or_else(|| entry.timestamp.to_string());
+                    let status = if entry.success { "OK" } else { "FAILED" };
+                    println!("[{}] r{}-r{} | {} objects, {} | {}ms | {}",
+                        date, entry.from_rev, entry.to_rev,
+                        entry.objects_transferred,
+                        format_size(entry.bytes_transferred),
+                        entry.duration_ms,
+                        status);
+                }
+
+                // Summary
+                let total_objects: u64 = entries.iter().map(|e| e.objects_transferred).sum();
+                let total_bytes: u64 = entries.iter().map(|e| e.bytes_transferred).sum();
+                let successes = entries.iter().filter(|e| e.success).count();
+                println!("\nSummary: {} syncs ({} successful), {} objects, {}",
+                    entries.len(), successes, total_objects, format_size(total_bytes));
+            }
+            Ok(())
         }
     }
 }

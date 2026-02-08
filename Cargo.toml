@@ -5,6 +5,7 @@ members = [
     "dsvn-webdav",
     "dsvn-server",
     "dsvn-admin-cli",
+    "dsvnsync-cli",
 ]
 
 [workspace.package]
