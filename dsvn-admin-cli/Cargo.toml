@@ -17,6 +17,9 @@ tokio = { workspace = true }
 # CLI
 clap = { version = "4.5", features = ["derive"] }
 
+# Storage
+rusqlite = { workspace = true }
+
 # Error handling
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -24,6 +27,7 @@ thiserror = { workspace = true }
 # Configuration
 serde = { workspace = true }
 serde_json = { workspace = true }
+bincode = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
