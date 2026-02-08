@@ -2,7 +2,7 @@
 
 use super::{Config, WebDavError};
 use bytes::Bytes;
-use dsvn_core::{DiskRepository, DiskPropertyStore};
+use dsvn_core::{SqliteRepository, SqlitePropertyStore};
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Incoming, Request, Response};
 use std::collections::HashMap;
@@ -21,7 +21,7 @@ struct Transaction {
     pub staged_properties: HashMap<String, HashMap<String, String>>,
 }
 
-static DISK_REPO: OnceLock<Arc<DiskRepository>> = OnceLock::new();
+static SQLITE_REPO: OnceLock<Arc<SqliteRepository>> = OnceLock::new();
 
 lazy_static::lazy_static! {
     static ref TRANSACTIONS: Arc<RwLock<HashMap<String, Transaction>>> = {
@@ -37,11 +37,11 @@ lazy_static::lazy_static! {
     };
 }
 
-/// Initialize the global disk repository. Must be called once at server startup.
+/// Initialize the global SQLite repository. Must be called once at server startup.
 pub fn init_repository(repo_root: &Path) -> Result<(), String> {
-    let repo = DiskRepository::open(repo_root)
+    let repo = SqliteRepository::open(repo_root)
         .map_err(|e| format!("Failed to open repository at {:?}: {}", repo_root, e))?;
-    DISK_REPO
+    SQLITE_REPO
         .set(Arc::new(repo))
         .map_err(|_| "Repository already initialized".to_string())?;
     Ok(())
@@ -56,8 +56,8 @@ pub async fn init_repository_async() -> Result<(), String> {
     Ok(())
 }
 
-fn get_repo() -> &'static Arc<DiskRepository> {
-    DISK_REPO
+fn get_repo() -> &'static Arc<SqliteRepository> {
+    SQLITE_REPO
         .get()
         .expect("Repository not initialized — call init_repository() first")
 }

@@ -535,6 +535,11 @@ impl SqliteRepository {
         Ok(nr)
     }
 
+    /// Get a single commit by revision number
+    pub async fn get_commit(&self, rev: u64) -> Option<Commit> {
+        self.load_commit(rev).ok()
+    }
+
     pub async fn log(&self, start_rev: u64, limit: usize) -> Result<Vec<Commit>> {
         let current = *self.current_rev.read().await;
         let end = std::cmp::min(start_rev, current);
