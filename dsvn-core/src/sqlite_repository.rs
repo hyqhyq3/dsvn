@@ -622,7 +622,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_sqlite_repo_batch_sync() {
         let tmp = TempDir::new().unwrap();
         let repo = SqliteRepository::open(tmp.path()).unwrap();
@@ -631,7 +631,9 @@ mod tests {
         for i in 0..100 {
             repo.add_file_sync(&format!("file_{}.txt", i), format!("content {}", i).into_bytes(), false).unwrap();
         }
-        let rev = repo.commit_sync("bot".into(), "batch".into(), 1000).unwrap();
+        let rev = tokio::task::block_in_place(|| {
+            repo.commit_sync("bot".into(), "batch".into(), 1000)
+        }).unwrap();
         repo.end_batch();
         assert_eq!(rev, 1);
         let content = repo.get_file("/file_0.txt", 1).await.unwrap();
@@ -718,7 +720,7 @@ mod tests {
         assert!(!t2.contains_key("a.txt"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_delta_tree_batch_commit_sync() {
         let tmp = TempDir::new().unwrap();
         let repo = SqliteRepository::open(tmp.path()).unwrap();
@@ -727,13 +729,19 @@ mod tests {
         // Simulate multi-commit batch import
         repo.begin_batch();
         repo.add_file_sync("file1.txt", b"content1".to_vec(), false).unwrap();
-        repo.commit_sync("bot".into(), "commit 1".into(), 100).unwrap();
+        tokio::task::block_in_place(|| {
+            repo.commit_sync("bot".into(), "commit 1".into(), 100)
+        }).unwrap();
 
         repo.add_file_sync("file2.txt", b"content2".to_vec(), false).unwrap();
-        repo.commit_sync("bot".into(), "commit 2".into(), 200).unwrap();
+        tokio::task::block_in_place(|| {
+            repo.commit_sync("bot".into(), "commit 2".into(), 200)
+        }).unwrap();
 
         repo.delete_file_sync("file1.txt").unwrap();
-        repo.commit_sync("bot".into(), "commit 3".into(), 300).unwrap();
+        tokio::task::block_in_place(|| {
+            repo.commit_sync("bot".into(), "commit 3".into(), 300)
+        }).unwrap();
         repo.end_batch();
 
         // Verify delta reconstruction
