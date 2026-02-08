@@ -583,6 +583,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "bytes",
  "chrono",
  "dsvn-core",
@@ -591,6 +592,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "lazy_static",
+ "md5",
  "quick-xml",
  "regex",
  "rustls",
@@ -1408,6 +1410,12 @@ checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
 dependencies = [
  "regex-automata",
 ]
+
+[[package]]
+name = "md5"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
 
 [[package]]
 name = "memchr"

@@ -126,10 +126,10 @@ async fn test_sync_config_set() {
 
     let new_config = SyncConfig {
         enabled: false,
-        cache_dir: Some("/tmp/test-cache".into()),
         max_cache_age_hours: 48,
         require_auth: true,
         allowed_sources: vec!["192.168.1.0/24".into()],
+        allow_empty: false,
     };
     let body = serde_json::to_vec(&new_config).unwrap();
 

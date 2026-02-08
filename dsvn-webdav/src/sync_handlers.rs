@@ -457,17 +457,17 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = SyncConfig {
             enabled: false,
-            cache_dir: Some("/tmp/cache".into()),
             max_cache_age_hours: 48,
             require_auth: true,
             allowed_sources: vec!["10.0.0.0/8".into()],
+            allow_empty: false,
         };
         config.save(tmp.path()).unwrap();
         let loaded = SyncConfig::load(tmp.path()).unwrap();
         assert!(!loaded.enabled);
-        assert_eq!(loaded.cache_dir, Some("/tmp/cache".into()));
         assert_eq!(loaded.max_cache_age_hours, 48);
         assert!(loaded.require_auth);
         assert_eq!(loaded.allowed_sources, vec!["10.0.0.0/8".to_string()]);
+        assert!(!loaded.allow_empty);
     }
 }

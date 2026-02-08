@@ -310,6 +310,7 @@ mod tests {
             objects: objects.clone(),
             properties: vec![],
             content_hash: hash,
+            empty_commit: false,
         };
 
         assert!(rev_data.verify_content_hash());
@@ -355,6 +356,7 @@ mod tests {
             content_hash: RevisionData::compute_content_hash(&[
                 (ObjectId::from_data(b"main.rs content"), b"fn main() {}".to_vec()),
             ]),
+            empty_commit: false,
         };
 
         let msg = SyncMessage::RevisionData(rd.clone());

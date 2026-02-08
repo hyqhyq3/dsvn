@@ -433,63 +433,539 @@ async fn handle_svn_special_propfind(path: &str, current_rev: u64, uuid: &str) -
 
 pub async fn report_handler(req: Request<Incoming>, _config: &Config) -> Result<Response<Full<Bytes>>, WebDavError> {
     let repo = get_repo();
+    let path = req.uri().path().to_string();
     let body = match req.into_body().collect().await {
         Ok(c) => c.to_bytes(),
         Err(e) => return Ok(Response::builder().status(400).body(Full::new(Bytes::from(format!("Failed: {}", e)))).unwrap()),
     };
     let body_str = String::from_utf8_lossy(&body);
-    tracing::info!("REPORT body: {}", body_str);
+    tracing::info!("REPORT {} body: {}", path, body_str);
+
+    // Dispatch to specific report handler based on XML root element
     let xml = if body_str.contains("update-report") || body_str.contains("<S:update") {
-        let current_rev = repo.current_rev().await;
-        let uuid = repo.uuid();
-        let now = chrono::Utc::now();
-        let target_rev = extract_text_between(&body_str, "<S:target-revision>", "</S:target-revision>")
-            .and_then(|s| s.parse::<u64>().ok()).unwrap_or(current_rev);
-        format!(r#"<?xml version="1.0" encoding="utf-8"?>
+        handle_update_report(&body_str, repo).await?
+    } else if body_str.contains("log-report") || body_str.contains("log-item") || (body_str.contains("log") && !body_str.contains("get-locations")) {
+        handle_log_report(&body_str, repo).await?
+    } else if body_str.contains("get-locations") {
+        handle_get_locations_report(&body_str, &path, repo).await?
+    } else if body_str.contains("get-dated-rev") {
+        handle_dated_rev_report(&body_str, repo).await?
+    } else if body_str.contains("mergeinfo-report") {
+        handle_mergeinfo_report(&body_str, repo).await?
+    } else if body_str.contains("get-locks-report") {
+        handle_get_locks_report(&body_str).await?
+    } else if body_str.contains("replay-report") {
+        handle_replay_report(&body_str, repo).await?
+    } else if body_str.contains("get-deleted-rev") {
+        handle_get_deleted_rev_report(&body_str, repo).await?
+    } else if body_str.contains("inherited-props-report") {
+        handle_inherited_props_report(&body_str, &path, repo).await?
+    } else {
+        return Ok(Response::builder().status(501)
+            .header("Content-Type", "text/xml; charset=\"utf-8\"")
+            .body(Full::new(Bytes::from(format!(
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+                 <D:error xmlns:D=\"DAV:\" xmlns:m=\"http://apache.org/dav/xmlns\" xmlns:C=\"svn:\">\n\
+                 <C:error/>\n\
+                 <m:human-readable errcode=\"200007\">\n\
+                 Unsupported report type.\n\
+                 </m:human-readable>\n\
+                 </D:error>"
+            )))).unwrap());
+    };
+    Ok(Response::builder().status(200)
+        .header("Content-Type", "text/xml; charset=\"utf-8\"")
+        .body(Full::new(Bytes::from(xml))).unwrap())
+}
+
+/// Handle update-report (checkout/switch/update)
+///
+/// This is the primary report for `svn checkout` and `svn update`.
+/// It sends the full tree content to the client when `send-all="true"` is requested.
+async fn handle_update_report(body_str: &str, repo: &SqliteRepository) -> Result<String, WebDavError> {
+    let current_rev = repo.current_rev().await;
+    let uuid = repo.uuid();
+
+    // Parse target revision
+    let target_rev = extract_text_between(body_str, "<S:target-revision>", "</S:target-revision>")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(current_rev);
+
+    // Parse source revision (for updates — what the client already has)
+    let src_rev = extract_text_between(body_str, "<S:src-path>", "</S:src-path>")
+        .and_then(|_| {
+            // If src-path is present, check for entry with rev attribute
+            extract_text_between(body_str, "rev=\"", "\"")
+                .and_then(|s| s.parse::<u64>().ok())
+        });
+
+    // Parse depth
+    let _depth = extract_text_between(body_str, "<S:depth>", "</S:depth>")
+        .unwrap_or("infinity");
+
+    // Check if this is a fresh checkout (no source revision / rev=0) or an update
+    let is_fresh_checkout = src_rev.is_none() || src_rev == Some(0);
+
+    // Determine the target path (sub-path being checked out)
+    let _update_target = extract_text_between(body_str, "<S:update-target>", "</S:update-target>")
+        .unwrap_or("");
+
+    // Build tree at target revision
+    let tree = repo.get_tree_at_rev(target_rev)
+        .map_err(|e| WebDavError::Internal(format!("Failed to get tree at rev {}: {}", target_rev, e)))?;
+
+    // Get commit info for the target revision
+    let commit = repo.get_commit(target_rev).await;
+    let commit_date = commit.as_ref()
+        .and_then(|c| chrono::DateTime::from_timestamp(c.timestamp, 0))
+        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S.000000Z").to_string())
+        .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S.000000Z").to_string());
+    let commit_author = commit.as_ref()
+        .map(|c| c.author.clone())
+        .unwrap_or_default();
+
+    let mut xml = format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
 <S:update-report xmlns:S="svn:" xmlns:V="http://subversion.tigris.org/xmlns/dav/" xmlns:D="DAV:" send-all="true" inline-props="true">
 <S:target-revision rev="{rev}"/>
 <S:open-directory rev="{rev}">
 <D:checked-in><D:href>{prefix}/!svn/rvr/{rev}/</D:href></D:checked-in>
 <S:set-prop name="svn:entry:committed-rev">{rev}</S:set-prop>
 <S:set-prop name="svn:entry:committed-date">{date}</S:set-prop>
-<S:remove-prop name="svn:entry:last-author"/>
-<S:set-prop name="svn:entry:uuid">{uuid}</S:set-prop>
-</S:open-directory>
-</S:update-report>"#,
-            prefix=REPO_PREFIX, rev=target_rev,
-            date=now.format("%Y-%m-%dT%H:%M:%S.000000Z"), uuid=uuid)
-    } else if body_str.contains("log") {
-        let current_rev = repo.current_rev().await;
-        let (start_rev, end_rev, reverse) = parse_log_range(&body_str, current_rev);
+<S:set-prop name="svn:entry:last-author">{author}</S:set-prop>
+<S:set-prop name="svn:entry:uuid">{uuid}</S:set-prop>"#,
+        prefix=REPO_PREFIX, rev=target_rev, date=commit_date,
+        author=escape_xml(&commit_author), uuid=uuid
+    );
 
-        let mut items = Vec::new();
-        for rev in start_rev..=end_rev {
-            if let Some(c) = repo.get_commit(rev).await {
-                items.push(format!(
-                    r#"<S:log-item><D:version-name>{}</D:version-name><D:creator-displayname>{}</D:creator-displayname><S:date>{}</S:date><D:comment>{}</D:comment></S:log-item>"#,
-                    rev, escape_xml(&c.author),
-                    chrono::DateTime::from_timestamp(c.timestamp, 0)
-                        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S.000000Z").to_string())
-                        .unwrap_or_default(),
-                    escape_xml(&c.message)));
+    if is_fresh_checkout {
+        // For fresh checkout, send all files as add-file entries
+        // Collect and sort entries for deterministic output
+        let mut entries: Vec<_> = tree.iter().collect();
+        entries.sort_by_key(|(path, _)| path.clone());
+
+        // Track directories we've opened
+        let mut opened_dirs: Vec<String> = Vec::new();
+
+        for (file_path, entry) in &entries {
+            use dsvn_core::ObjectKind;
+            if entry.kind == ObjectKind::Blob {
+                // Ensure parent directories are opened
+                let parts: Vec<&str> = file_path.split('/').collect();
+                let mut current_dir = String::new();
+                for i in 0..parts.len().saturating_sub(1) {
+                    let dir = if current_dir.is_empty() {
+                        parts[i].to_string()
+                    } else {
+                        format!("{}/{}", current_dir, parts[i])
+                    };
+                    if !opened_dirs.contains(&dir) {
+                        xml.push_str(&format!(
+                            "\n<S:add-directory name=\"{}\" bc-url=\"{}/!svn/bc/{}/{}\">\n\
+                             <D:checked-in><D:href>{}/!svn/rvr/{}/{}</D:href></D:checked-in>\n\
+                             <S:set-prop name=\"svn:entry:committed-rev\">{}</S:set-prop>\n\
+                             <S:set-prop name=\"svn:entry:committed-date\">{}</S:set-prop>\n\
+                             <S:set-prop name=\"svn:entry:last-author\">{}</S:set-prop>\n\
+                             <S:set-prop name=\"svn:entry:uuid\">{}</S:set-prop>",
+                            escape_xml(parts[i]),
+                            REPO_PREFIX, target_rev, dir,
+                            REPO_PREFIX, target_rev, dir,
+                            target_rev, commit_date, escape_xml(&commit_author), uuid
+                        ));
+                        opened_dirs.push(dir);
+                    }
+                    current_dir = if current_dir.is_empty() {
+                        parts[i].to_string()
+                    } else {
+                        format!("{}/{}", current_dir, parts[i])
+                    };
+                }
+
+                // Get file content
+                let file_content = repo.get_file(&format!("/{}", file_path), target_rev).await;
+                let filename = parts.last().unwrap_or(&"");
+
+                xml.push_str(&format!(
+                    "\n<S:add-file name=\"{}\">\n\
+                     <D:checked-in><D:href>{}/!svn/rvr/{}/{}</D:href></D:checked-in>\n\
+                     <S:set-prop name=\"svn:entry:committed-rev\">{}</S:set-prop>\n\
+                     <S:set-prop name=\"svn:entry:committed-date\">{}</S:set-prop>\n\
+                     <S:set-prop name=\"svn:entry:last-author\">{}</S:set-prop>\n\
+                     <S:set-prop name=\"svn:entry:uuid\">{}</S:set-prop>",
+                    escape_xml(filename),
+                    REPO_PREFIX, target_rev, file_path,
+                    target_rev, commit_date, escape_xml(&commit_author), uuid
+                ));
+
+                // Include file content using txdelta if available
+                if let Ok(content) = file_content {
+                    if !content.is_empty() {
+                        use base64::Engine;
+                        let encoded = base64::engine::general_purpose::STANDARD.encode(&content);
+                        xml.push_str(&format!(
+                            "\n<S:txdelta>{}</S:txdelta>",
+                            encoded
+                        ));
+                    }
+                }
+                // Compute MD5 checksum
+                if let Ok(content) = repo.get_file(&format!("/{}", file_path), target_rev).await {
+                    let digest = md5::compute(&content);
+                    xml.push_str(&format!(
+                        "\n<S:prop><V:md5-checksum>{:x}</V:md5-checksum></S:prop>",
+                        digest
+                    ));
+                }
+                xml.push_str("\n</S:add-file>");
             }
         }
-        if reverse {
-            items.reverse();
-        }
 
-        let mut s = String::from(r#"<?xml version="1.0" encoding="utf-8"?><S:log-report xmlns:S="svn:" xmlns:D="DAV:">"#);
-        for item in items {
-            s.push_str(&item);
+        // Close opened directories in reverse order
+        for _ in opened_dirs.iter().rev() {
+            xml.push_str("\n</S:add-directory>");
         }
-        s.push_str("</S:log-report>");
-        s
+    }
+    // For incremental updates (src_rev is set), we would compute the diff
+    // between src_rev and target_rev. For now, fall through to the basic response.
+
+    xml.push_str("\n</S:open-directory>\n</S:update-report>");
+    Ok(xml)
+}
+
+/// Handle log-report (svn log)
+///
+/// Supports:
+/// - start-revision / end-revision range
+/// - limit (max number of log entries)
+/// - discover-changed-paths (include changed file list per commit)
+/// - revprop filtering
+async fn handle_log_report(body_str: &str, repo: &SqliteRepository) -> Result<String, WebDavError> {
+    let current_rev = repo.current_rev().await;
+    let (start_rev, end_rev, reverse) = parse_log_range(body_str, current_rev);
+
+    // Parse limit
+    let limit = extract_text_between(body_str, "<S:limit>", "</S:limit>")
+        .or_else(|| extract_text_between(body_str, "<limit>", "</limit>"))
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(usize::MAX);
+
+    // Check if changed paths are requested
+    let discover_changed_paths = body_str.contains("discover-changed-paths");
+
+    // Check if specific revprops are requested
+    let include_all_revprops = body_str.contains("all-revprops");
+    let requested_revprops: Vec<String> = find_all_between(body_str, "<S:revprop>", "</S:revprop>")
+        .into_iter()
+        .map(|s| {
+            extract_text_between(&s, "<S:revprop>", "</S:revprop>")
+                .unwrap_or("")
+                .to_string()
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut items = Vec::new();
+    for rev in start_rev..=end_rev {
+        if items.len() >= limit { break; }
+        if let Some(c) = repo.get_commit(rev).await {
+            let date_str = chrono::DateTime::from_timestamp(c.timestamp, 0)
+                .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S.000000Z").to_string())
+                .unwrap_or_default();
+
+            let mut item = format!("<S:log-item>\n<D:version-name>{}</D:version-name>\n", rev);
+
+            // Include revprops based on request
+            let should_include_author = include_all_revprops
+                || requested_revprops.is_empty()
+                || requested_revprops.iter().any(|p| p == "svn:author");
+            let should_include_date = include_all_revprops
+                || requested_revprops.is_empty()
+                || requested_revprops.iter().any(|p| p == "svn:date");
+            let should_include_log = include_all_revprops
+                || requested_revprops.is_empty()
+                || requested_revprops.iter().any(|p| p == "svn:log");
+
+            if should_include_author {
+                item.push_str(&format!("<D:creator-displayname>{}</D:creator-displayname>\n",
+                    escape_xml(&c.author)));
+            }
+            if should_include_date {
+                item.push_str(&format!("<S:date>{}</S:date>\n", date_str));
+            }
+            if should_include_log {
+                item.push_str(&format!("<D:comment>{}</D:comment>\n", escape_xml(&c.message)));
+            }
+
+            // Include changed paths if requested
+            if discover_changed_paths && rev > 0 {
+                if let Ok(delta) = repo.get_delta_tree(rev) {
+                    if !delta.changes.is_empty() {
+                        item.push_str("<S:changed-path-item>\n");
+                        for change in &delta.changes {
+                            match change {
+                                dsvn_core::TreeChange::Upsert { path, .. } => {
+                                    // Determine if this is an add or modify
+                                    // Check if the file existed in the parent revision
+                                    let action = if rev > 1 {
+                                        if let Ok(parent_tree) = repo.get_tree_at_rev(rev - 1) {
+                                            if parent_tree.contains_key(path) { "M" } else { "A" }
+                                        } else { "A" }
+                                    } else { "A" };
+                                    item.push_str(&format!(
+                                        "<S:modified-path node-kind=\"file\" text-mods=\"true\" prop-mods=\"false\">{}</S:modified-path>\n",
+                                        escape_xml(&format!("/{}", path))
+                                    ));
+                                    // Also use the action attribute for SVN compatibility
+                                    let _ = action; // Used in the S:added-path / S:modified-path below
+                                }
+                                dsvn_core::TreeChange::Delete { path } => {
+                                    item.push_str(&format!(
+                                        "<S:deleted-path node-kind=\"file\">{}</S:deleted-path>\n",
+                                        escape_xml(&format!("/{}", path))
+                                    ));
+                                }
+                            }
+                        }
+                        item.push_str("</S:changed-path-item>\n");
+                    }
+                }
+            }
+
+            // Include sub-merged-revisions stub (SVN client may expect this)
+            item.push_str("<S:has-children/>\n");
+            item.push_str("</S:log-item>\n");
+            items.push(item);
+        }
+    }
+
+    if reverse {
+        items.reverse();
+    }
+
+    let mut s = String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<S:log-report xmlns:S=\"svn:\" xmlns:D=\"DAV:\">\n");
+    for item in items {
+        s.push_str(&item);
+    }
+    s.push_str("</S:log-report>");
+    Ok(s)
+}
+
+/// Handle get-locations-report
+///
+/// Returns the path of a file/directory at different revisions.
+/// Used by `svn log --use-merge-history`, `svn blame`, etc.
+async fn handle_get_locations_report(body_str: &str, _request_path: &str, repo: &SqliteRepository) -> Result<String, WebDavError> {
+    let current_rev = repo.current_rev().await;
+
+    // Parse path from request
+    let query_path = extract_text_between(body_str, "<S:path>", "</S:path>")
+        .or_else(|| extract_text_between(body_str, "<path>", "</path>"))
+        .unwrap_or("")
+        .trim_start_matches('/')
+        .to_string();
+
+    // Parse peg revision
+    let peg_rev = extract_text_between(body_str, "<S:peg-revision>", "</S:peg-revision>")
+        .or_else(|| extract_text_between(body_str, "<peg-revision>", "</peg-revision>"))
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(current_rev);
+
+    // Parse location revisions
+    let location_revs: Vec<u64> = find_all_between(body_str, "<S:location-revision>", "</S:location-revision>")
+        .iter()
+        .filter_map(|s| extract_text_between(s, "<S:location-revision>", "</S:location-revision>"))
+        .filter_map(|s| s.parse::<u64>().ok())
+        .collect();
+
+    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<S:get-locations-report xmlns:S=\"svn:\" xmlns:D=\"DAV:\">\n");
+
+    // For each requested revision, check if the path exists
+    // In our simple model, paths don't move, so if a file existed at the peg revision,
+    // it exists at the same path in all revisions where it's present.
+    for rev in &location_revs {
+        let rev = std::cmp::min(*rev, current_rev);
+        if let Ok(tree) = repo.get_tree_at_rev(rev) {
+            // Check if the path exists at this revision
+            if tree.contains_key(&query_path) || (query_path.is_empty() && rev <= peg_rev) {
+                let path_with_slash = if query_path.is_empty() {
+                    "/".to_string()
+                } else {
+                    format!("/{}", query_path)
+                };
+                xml.push_str(&format!(
+                    "<S:location rev=\"{}\" path=\"{}\"/>\n",
+                    rev, escape_xml(&path_with_slash)
+                ));
+            }
+        }
+    }
+
+    xml.push_str("</S:get-locations-report>");
+    Ok(xml)
+}
+
+/// Handle get-dated-rev-report
+///
+/// Returns the revision number that was current at a given date/time.
+/// Used by `svn checkout -r {date}`, `svn log -r {date}:HEAD`, etc.
+async fn handle_dated_rev_report(body_str: &str, repo: &SqliteRepository) -> Result<String, WebDavError> {
+    let current_rev = repo.current_rev().await;
+
+    // Parse the requested date
+    let date_str = extract_text_between(body_str, "<D:creationdate>", "</D:creationdate>")
+        .or_else(|| extract_text_between(body_str, "<S:creationdate>", "</S:creationdate>"))
+        .unwrap_or("");
+
+    // Parse the date (ISO 8601 format)
+    let target_timestamp = if !date_str.is_empty() {
+        chrono::DateTime::parse_from_rfc3339(date_str)
+            .map(|dt| dt.timestamp())
+            .unwrap_or(i64::MAX)
     } else {
-        return Ok(Response::builder().status(400).body(Full::new(Bytes::from("Unknown report"))).unwrap());
+        i64::MAX
     };
-    Ok(Response::builder().status(200)
-        .header("Content-Type", "text/xml; charset=\"utf-8\"")
-        .body(Full::new(Bytes::from(xml))).unwrap())
+
+    // Binary search for the revision at or before the given timestamp
+    let mut found_rev = 0u64;
+    for rev in (0..=current_rev).rev() {
+        if let Some(c) = repo.get_commit(rev).await {
+            if c.timestamp <= target_timestamp {
+                found_rev = rev;
+                break;
+            }
+        }
+    }
+
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+         <S:dated-rev-report xmlns:S=\"svn:\" xmlns:D=\"DAV:\">\n\
+         <D:version-name>{}</D:version-name>\n\
+         </S:dated-rev-report>",
+        found_rev
+    );
+    Ok(xml)
+}
+
+/// Handle mergeinfo-report
+///
+/// Returns merge tracking information. Since we don't have full merge tracking,
+/// we return an empty report.
+async fn handle_mergeinfo_report(_body_str: &str, _repo: &SqliteRepository) -> Result<String, WebDavError> {
+    Ok("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+        <S:mergeinfo-report xmlns:S=\"svn:\">\n\
+        </S:mergeinfo-report>".to_string())
+}
+
+/// Handle get-locks-report
+///
+/// Returns lock information for paths. Since we don't have locking support,
+/// we return an empty report.
+async fn handle_get_locks_report(_body_str: &str) -> Result<String, WebDavError> {
+    Ok("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+        <S:get-locks-report xmlns:S=\"svn:\">\n\
+        </S:get-locks-report>".to_string())
+}
+
+/// Handle replay-report
+///
+/// Replays a revision's changes. Used for svnsync and similar tools.
+async fn handle_replay_report(body_str: &str, repo: &SqliteRepository) -> Result<String, WebDavError> {
+    let current_rev = repo.current_rev().await;
+
+    // Parse the revision to replay
+    let replay_rev = extract_text_between(body_str, "<S:revision>", "</S:revision>")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(current_rev);
+
+    // Build an editor-style replay of the revision
+    let mut xml = format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+         <S:editor-report xmlns:S=\"svn:\">\n\
+         <S:target-revision>{}</S:target-revision>\n",
+        replay_rev
+    );
+
+    if let Ok(delta) = repo.get_delta_tree(replay_rev) {
+        xml.push_str("<S:open-root>\n");
+        for change in &delta.changes {
+            match change {
+                dsvn_core::TreeChange::Upsert { path, .. } => {
+                    xml.push_str(&format!(
+                        "<S:add-file name=\"{}\">\n</S:add-file>\n",
+                        escape_xml(path)
+                    ));
+                }
+                dsvn_core::TreeChange::Delete { path } => {
+                    xml.push_str(&format!(
+                        "<S:delete-entry name=\"{}\"/>\n",
+                        escape_xml(path)
+                    ));
+                }
+            }
+        }
+        xml.push_str("</S:open-root>\n");
+    }
+
+    xml.push_str("</S:editor-report>");
+    Ok(xml)
+}
+
+/// Handle get-deleted-rev-report
+///
+/// Returns the revision in which a path was deleted.
+async fn handle_get_deleted_rev_report(body_str: &str, repo: &SqliteRepository) -> Result<String, WebDavError> {
+    let current_rev = repo.current_rev().await;
+
+    let query_path = extract_text_between(body_str, "<S:path>", "</S:path>")
+        .unwrap_or("")
+        .trim_start_matches('/')
+        .to_string();
+
+    let peg_rev = extract_text_between(body_str, "<S:peg-revision>", "</S:peg-revision>")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(current_rev);
+
+    let end_rev = extract_text_between(body_str, "<S:end-revision>", "</S:end-revision>")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(current_rev);
+
+    // Search for the revision where the path was deleted
+    let mut deleted_rev = 0u64; // 0 = not deleted (SVN_INVALID_REVNUM)
+    for rev in (peg_rev + 1)..=std::cmp::min(end_rev, current_rev) {
+        if let Ok(delta) = repo.get_delta_tree(rev) {
+            for change in &delta.changes {
+                if let dsvn_core::TreeChange::Delete { path } = change {
+                    if path == &query_path || query_path.starts_with(&format!("{}/", path)) {
+                        deleted_rev = rev;
+                        break;
+                    }
+                }
+            }
+            if deleted_rev > 0 { break; }
+        }
+    }
+
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+         <S:get-deleted-rev-report xmlns:S=\"svn:\" xmlns:D=\"DAV:\">\n\
+         <D:version-name>{}</D:version-name>\n\
+         </S:get-deleted-rev-report>",
+        deleted_rev
+    );
+    Ok(xml)
+}
+
+/// Handle inherited-props-report
+///
+/// Returns inherited properties for a path. Used by svn 1.8+ clients.
+async fn handle_inherited_props_report(body_str: &str, _request_path: &str, _repo: &SqliteRepository) -> Result<String, WebDavError> {
+    let _query_path = extract_text_between(body_str, "<S:path>", "</S:path>")
+        .unwrap_or("");
+
+    // Return empty inherited props for now
+    Ok("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+        <S:inherited-props-report xmlns:S=\"svn:\" xmlns:D=\"DAV:\">\n\
+        </S:inherited-props-report>".to_string())
 }
 
 // ==================== MERGE ====================
@@ -571,17 +1047,54 @@ pub async fn merge_handler(req: Request<Incoming>, _config: &Config) -> Result<R
 
 pub async fn get_handler(req: Request<Incoming>, _config: &Config) -> Result<Response<Full<Bytes>>, WebDavError> {
     let repo = get_repo();
-    let path = req.uri().path();
+    let path = req.uri().path().to_string();
+
+    // Handle GET /!svn/act/ — list all activities
+    let special = path.strip_prefix(REPO_PREFIX).unwrap_or(&path);
+    if special == "/!svn/act/" || special == "/!svn/act" {
+        return handle_list_activities().await;
+    }
+
     if path.contains("!svn") {
         return Ok(Response::builder().status(404).body(Full::new(Bytes::from("Not found"))).unwrap());
     }
     if path.ends_with('/') || path == "/svn" {
         return Ok(Response::builder().status(405).header("Allow", "PROPFIND").body(Full::new(Bytes::from("Use PROPFIND"))).unwrap());
     }
-    match repo.get_file(path, repo.current_rev().await).await {
+    match repo.get_file(&path, repo.current_rev().await).await {
         Ok(content) => Ok(Response::builder().status(200).header("Content-Type", "application/octet-stream").body(Full::new(content)).unwrap()),
         Err(_) => Ok(Response::builder().status(404).body(Full::new(Bytes::from("Not found"))).unwrap()),
     }
+}
+
+/// Handle GET /!svn/act/ — list all active activities (transactions)
+async fn handle_list_activities() -> Result<Response<Full<Bytes>>, WebDavError> {
+    let repo = get_repo();
+    let uuid = repo.uuid().to_string();
+    let txns = TRANSACTIONS.read().await;
+
+    let mut hrefs = String::new();
+    for txn_name in txns.keys() {
+        hrefs.push_str(&format!(
+            "  <D:href>{}/!svn/act/{}</D:href>\n",
+            REPO_PREFIX, txn_name
+        ));
+    }
+
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+         <D:activity-collection-set xmlns:D=\"DAV:\">\n\
+         {hrefs}\
+         </D:activity-collection-set>",
+        hrefs = hrefs
+    );
+
+    Ok(Response::builder()
+        .status(200)
+        .header("Content-Type", "text/xml; charset=\"utf-8\"")
+        .header("SVN-Repository-UUID", uuid)
+        .body(Full::new(Bytes::from(xml)))
+        .unwrap())
 }
 
 // ==================== PROPPATCH ====================
@@ -742,12 +1255,149 @@ pub async fn move_handler(_req: Request<Incoming>, _config: &Config) -> Result<R
 pub async fn mkcol_handler(_req: Request<Incoming>, _config: &Config) -> Result<Response<Full<Bytes>>, WebDavError> {
     Ok(Response::builder().status(201).body(Full::new(Bytes::new())).unwrap())
 }
-pub async fn delete_handler(_req: Request<Incoming>, _config: &Config) -> Result<Response<Full<Bytes>>, WebDavError> {
+pub async fn delete_handler(req: Request<Incoming>, _config: &Config) -> Result<Response<Full<Bytes>>, WebDavError> {
+    let path = req.uri().path().to_string();
+    let _ = req.into_body().collect().await;
+    tracing::info!("DELETE {}", path);
+
+    let special = path.strip_prefix(REPO_PREFIX).unwrap_or(&path);
+
+    // Handle DELETE /!svn/act/{txn-id} — abort/delete an activity
+    if special.starts_with("/!svn/act/") {
+        let txn_name = special.strip_prefix("/!svn/act/")
+            .unwrap_or("")
+            .trim_end_matches('/');
+
+        if txn_name.is_empty() {
+            return Ok(Response::builder()
+                .status(405)
+                .body(Full::new(Bytes::from("Cannot DELETE the activity collection itself")))
+                .unwrap());
+        }
+
+        return handle_delete_activity(txn_name).await;
+    }
+
+    // Default: generic DELETE (stub)
     Ok(Response::builder().status(204).body(Full::new(Bytes::new())).unwrap())
+}
+
+/// Handle DELETE /!svn/act/{txn-id} — abort and remove an activity (transaction)
+async fn handle_delete_activity(txn_name: &str) -> Result<Response<Full<Bytes>>, WebDavError> {
+    let removed = {
+        let mut txns = TRANSACTIONS.write().await;
+        txns.remove(txn_name)
+    };
+
+    match removed {
+        Some(txn) => {
+            tracing::info!(
+                "DELETE activity {}: aborted (base_rev={}, staged_files={}, staged_props={})",
+                txn_name, txn.base_revision,
+                txn.staged_files.len(), txn.staged_properties.len()
+            );
+            Ok(Response::builder()
+                .status(204)
+                .body(Full::new(Bytes::new()))
+                .unwrap())
+        }
+        None => {
+            tracing::warn!("DELETE activity {}: not found", txn_name);
+            Ok(Response::builder()
+                .status(404)
+                .header("Content-Type", "text/xml; charset=\"utf-8\"")
+                .body(Full::new(Bytes::from(format!(
+                    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+                     <D:error xmlns:D=\"DAV:\" xmlns:m=\"http://apache.org/dav/xmlns\" xmlns:C=\"svn:\">\n\
+                     <C:error/>\n\
+                     <m:human-readable errcode=\"160007\">\n\
+                     Activity '{}' not found.\n\
+                     </m:human-readable>\n\
+                     </D:error>", escape_xml(txn_name)
+                ))))
+                .unwrap())
+        }
+    }
 }
 pub async fn checkout_handler(_req: Request<Incoming>, _config: &Config) -> Result<Response<Full<Bytes>>, WebDavError> {
     Ok(Response::builder().status(200).body(Full::new(Bytes::new())).unwrap())
 }
-pub async fn mkactivity_handler(_req: Request<Incoming>, _config: &Config) -> Result<Response<Full<Bytes>>, WebDavError> {
-    Ok(Response::builder().status(201).body(Full::new(Bytes::new())).unwrap())
+pub async fn mkactivity_handler(req: Request<Incoming>, _config: &Config) -> Result<Response<Full<Bytes>>, WebDavError> {
+    let repo = get_repo();
+    let path = req.uri().path().to_string();
+    let _ = req.into_body().collect().await;
+
+    tracing::info!("MKACTIVITY {}", path);
+
+    let special = path.strip_prefix(REPO_PREFIX).unwrap_or(&path);
+
+    // MKACTIVITY /!svn/act/{txn-id} — create activity with client-supplied ID
+    // MKACTIVITY /!svn/act/          — create activity with server-generated ID
+    if special.starts_with("/!svn/act/") {
+        let client_txn_id = special.strip_prefix("/!svn/act/")
+            .unwrap_or("")
+            .trim_end_matches('/');
+
+        let current_rev = repo.current_rev().await;
+
+        // Use client-supplied ID if non-empty, otherwise generate one
+        let txn_name = if client_txn_id.is_empty() {
+            let txn_seq = TXN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            format!("{}-{}", current_rev, txn_seq)
+        } else {
+            client_txn_id.to_string()
+        };
+
+        // Check for duplicate activity
+        {
+            let txns = TRANSACTIONS.read().await;
+            if txns.contains_key(&txn_name) {
+                tracing::warn!("MKACTIVITY: activity already exists: {}", txn_name);
+                return Ok(Response::builder()
+                    .status(405)
+                    .header("Content-Type", "text/xml; charset=\"utf-8\"")
+                    .body(Full::new(Bytes::from(format!(
+                        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+                         <D:error xmlns:D=\"DAV:\" xmlns:m=\"http://apache.org/dav/xmlns\" xmlns:C=\"svn:\">\n\
+                         <C:error/>\n\
+                         <m:human-readable errcode=\"160024\">\n\
+                         Activity '{}' already exists.\n\
+                         </m:human-readable>\n\
+                         </D:error>", escape_xml(&txn_name)
+                    ))))
+                    .unwrap());
+            }
+        }
+
+        let txn = Transaction {
+            id: txn_name.clone(),
+            base_revision: current_rev,
+            author: String::new(),
+            log_message: String::new(),
+            created_at: chrono::Utc::now().timestamp(),
+            staged_files: HashMap::new(),
+            staged_properties: HashMap::new(),
+        };
+        TRANSACTIONS.write().await.insert(txn_name.clone(), txn);
+        tracing::info!("MKACTIVITY: created activity {}", txn_name);
+
+        return Ok(Response::builder()
+            .status(201)
+            .header("Location", format!("{}/!svn/act/{}", REPO_PREFIX, txn_name))
+            .header("Content-Type", "text/xml; charset=\"utf-8\"")
+            .header("SVN-Txn-Name", &txn_name)
+            .body(Full::new(Bytes::from(format!(
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+                 <D:mkactivity-response xmlns:D=\"DAV:\">\n\
+                 <D:href>{}/!svn/act/{}</D:href>\n\
+                 </D:mkactivity-response>",
+                REPO_PREFIX, txn_name
+            ))))
+            .unwrap());
+    }
+
+    // Fallback for non-activity paths
+    Ok(Response::builder().status(405)
+        .body(Full::new(Bytes::from("MKACTIVITY only supported on /!svn/act/")))
+        .unwrap())
 }

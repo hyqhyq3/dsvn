@@ -5,6 +5,7 @@
 pub mod handlers;
 pub mod proppatch;
 pub mod sync_handlers;
+pub mod dump_handlers;
 pub mod xml;
 
 pub use handlers::{report_handler, propfind_handler, options_handler, init_repository, init_repository_async, get_repo_arc};
@@ -95,6 +96,37 @@ impl WebDavHandler {
                 &repo,
             )
             .await);
+        }
+
+        // ── Dump/Load endpoints (svnrdump protocol) ──
+        let accept_header = req.headers().get("accept")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let content_type_header = req.headers().get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        if method.as_str() == "GET" && dump_handlers::is_dump_request(&accept_header) {
+            let query = uri.query().unwrap_or("");
+            let repo = handlers::get_repo_arc();
+            let _ = req.into_body();
+            return Ok(dump_handlers::handle_dump(repo, query).await);
+        }
+
+        if method.as_str() == "POST" && dump_handlers::is_load_request(&content_type_header) {
+            let repo = handlers::get_repo_arc();
+            let body_bytes = match req.into_body().collect().await {
+                Ok(c) => c.to_bytes().to_vec(),
+                Err(e) => {
+                    return Ok(Response::builder()
+                        .status(400)
+                        .body(Full::new(Bytes::from(format!("Bad request: {}", e))))
+                        .unwrap());
+                }
+            };
+            return Ok(dump_handlers::handle_load(repo, body_bytes).await);
         }
 
         // Route to appropriate handler

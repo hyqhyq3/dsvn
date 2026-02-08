@@ -40,7 +40,11 @@ http-body-util = "0.1"
 lazy_static = "1.5"
 chrono = { workspace = true }
 uuid = { version = "1.10", features = ["v4"] }
+base64 = "0.22"
+md5 = "0.7"
 
 [dev-dependencies]
 regex = "1.10"
 tempfile = "3.13"
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
