@@ -34,8 +34,6 @@ pub struct SyncEndpointInfo {
 pub struct SyncConfig {
     /// Whether sync endpoints are enabled.
     pub enabled: bool,
-    /// Optional cache directory for fetched objects.
-    pub cache_dir: Option<PathBuf>,
     /// Maximum age (in hours) for cached objects before eviction.
     pub max_cache_age_hours: u32,
     /// Whether authentication is required for sync endpoints.
@@ -43,20 +41,28 @@ pub struct SyncConfig {
     /// Allowed source patterns (`["*"]` means allow all).
     #[serde(default = "default_allowed_sources")]
     pub allowed_sources: Vec<String>,
+    /// Whether to allow syncing empty commits (no file/directory changes).
+    /// Corresponds to SVNSync's --allow-empty flag.
+    #[serde(default = "default_allow_empty")]
+    pub allow_empty: bool,
 }
 
 fn default_allowed_sources() -> Vec<String> {
     vec!["*".to_string()]
 }
 
+fn default_allow_empty() -> bool {
+    true
+}
+
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            cache_dir: None,
             max_cache_age_hours: 720, // 30 days
             require_auth: false,
             allowed_sources: default_allowed_sources(),
+            allow_empty: default_allow_empty(),
         }
     }
 }

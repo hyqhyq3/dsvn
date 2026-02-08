@@ -2,7 +2,7 @@
 //!
 //! Connects to a dsvn server's /sync endpoints to perform:
 //! - Metadata-first sync (fetch revision list, then on-demand objects)
-//! - Cached object fetching (skip objects already in local cache/repo)
+//! - Object deduplication (skip objects already in local repository)
 //! - Incremental pull from remote to local repository
 
 use anyhow::{anyhow, Context, Result};
@@ -12,7 +12,6 @@ use dsvn_core::{
     Blob, ObjectId, ObjectKind, SqliteRepository, SyncState, TreeChange,
     ReplicationLog, ReplicationLogEntry,
 };
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// HTTP sync client for pulling from a remote dsvn server.
@@ -176,19 +175,17 @@ impl RemoteSyncClient {
 pub struct RemotePull {
     client: RemoteSyncClient,
     dest_path: PathBuf,
-    cache_dir: Option<PathBuf>,
 }
 
 impl RemotePull {
-    pub fn new(source_url: &str, dest_path: &Path, cache_dir: Option<PathBuf>) -> Self {
+    pub fn new(source_url: &str, dest_path: &Path) -> Self {
         Self {
             client: RemoteSyncClient::new(source_url),
             dest_path: dest_path.to_path_buf(),
-            cache_dir,
         }
     }
 
-    /// Initialize a sync relationship with the remote server.
+    /// Initialize a sync relationship with remote server.
     pub async fn init(&self) -> Result<SyncState> {
         // Check if already initialized
         if let Some(existing) = SyncState::load(&self.dest_path)? {
@@ -208,8 +205,9 @@ impl RemotePull {
         Ok(state)
     }
 
-    /// Perform an incremental pull from the remote server.
+    /// Perform an incremental pull from remote server.
     /// Uses metadata-first approach: fetch rev list, then only needed objects.
+    /// Objects are deduplicated against the local repository's objects directory.
     pub async fn pull(&self) -> Result<PullResult> {
         let start_time = std::time::Instant::now();
 
@@ -241,11 +239,6 @@ impl RemotePull {
 
         state.source_head_rev = source_head;
         state.begin_sync(&self.dest_path)?;
-
-        // Set up cache
-        if let Some(ref cache_dir) = self.cache_dir {
-            std::fs::create_dir_all(cache_dir)?;
-        }
 
         let repl_log = ReplicationLog::new(&self.dest_path);
         let mut total_objects = 0u64;
@@ -281,7 +274,7 @@ impl RemotePull {
                     ));
                 }
 
-                // Store objects (with cache and dedup)
+                // Store objects (with dedup against local repository)
                 for (id, data) in &rev_data.objects {
                     let hex = id.to_hex();
                     let obj_path = dest_repo
@@ -295,35 +288,12 @@ impl RemotePull {
                         continue;
                     }
 
-                    // Check cache
-                    if let Some(ref cache_dir) = self.cache_dir {
-                        let cache_path = cache_dir.join(&hex[..2]).join(&hex[2..]);
-                        if cache_path.exists() {
-                            // Copy from cache to object store
-                            if let Some(parent) = obj_path.parent() {
-                                std::fs::create_dir_all(parent)?;
-                            }
-                            std::fs::copy(&cache_path, &obj_path)?;
-                            cached_objects += 1;
-                            continue;
-                        }
-                    }
-
                     // Store new object
                     if let Some(parent) = obj_path.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
                     let blob = Blob::new(data.clone(), false);
                     std::fs::write(&obj_path, blob.to_bytes()?)?;
-
-                    // Save to cache
-                    if let Some(ref cache_dir) = self.cache_dir {
-                        let cache_path = cache_dir.join(&hex[..2]).join(&hex[2..]);
-                        if let Some(parent) = cache_path.parent() {
-                            let _ = std::fs::create_dir_all(parent);
-                        }
-                        let _ = std::fs::write(&cache_path, blob.to_bytes()?);
-                    }
 
                     total_bytes += data.len() as u64;
                     total_objects += 1;
@@ -382,7 +352,7 @@ impl RemotePull {
 
         let duration_ms = start_time.elapsed().as_millis() as u64;
 
-        // Log the sync
+        // Log sync
         repl_log.append(&ReplicationLogEntry {
             from_rev,
             to_rev: source_head,
@@ -422,62 +392,91 @@ pub struct PullResult {
     pub already_up_to_date: bool,
 }
 
-/// Clean expired objects from the sync cache directory.
-pub fn clean_cache(cache_dir: &Path, max_age_hours: u32) -> Result<CacheCleanResult> {
-    if !cache_dir.exists() {
-        return Ok(CacheCleanResult {
-            files_removed: 0,
-            bytes_freed: 0,
+/// Fetch missing objects from remote and store them in local repository.
+/// Returns the number of objects fetched.
+pub async fn fetch_objects_and_repair(
+    source_url: &str,
+    dest_repo: &SqliteRepository,
+    object_ids: &[ObjectId],
+) -> Result<RepairResult> {
+    if object_ids.is_empty() {
+        return Ok(RepairResult {
+            objects_fetched: 0,
+            bytes_fetched: 0,
+            objects_already_present: 0,
         });
     }
 
-    let max_age = std::time::Duration::from_secs(max_age_hours as u64 * 3600);
-    let now = std::time::SystemTime::now();
-    let mut files_removed = 0u64;
-    let mut bytes_freed = 0u64;
+    let client = RemoteSyncClient::new(source_url);
+    let start_time = std::time::Instant::now();
 
-    for entry in walkdir(cache_dir)? {
-        if let Ok(metadata) = std::fs::metadata(&entry) {
-            if metadata.is_file() {
-                if let Ok(modified) = metadata.modified() {
-                    if let Ok(age) = now.duration_since(modified) {
-                        if age > max_age {
-                            bytes_freed += metadata.len();
-                            let _ = std::fs::remove_file(&entry);
-                            files_removed += 1;
-                        }
-                    }
-                }
-            }
+    // Filter out objects that already exist locally
+    let mut ids_to_fetch = Vec::new();
+    let mut already_present = 0u64;
+
+    for id in object_ids {
+        let hex = id.to_hex();
+        let obj_path = dest_repo
+            .root()
+            .join("objects")
+            .join(&hex[..2])
+            .join(&hex[2..]);
+
+        if obj_path.exists() {
+            already_present += 1;
+        } else {
+            ids_to_fetch.push(*id);
         }
     }
 
-    Ok(CacheCleanResult {
-        files_removed,
-        bytes_freed,
+    if ids_to_fetch.is_empty() {
+        return Ok(RepairResult {
+            objects_fetched: 0,
+            bytes_fetched: 0,
+            objects_already_present: already_present,
+        });
+    }
+
+    // Fetch from remote
+    let fetched_objects = client.get_objects(&ids_to_fetch).await?;
+
+    let mut objects_fetched = 0u64;
+    let mut bytes_fetched = 0u64;
+
+    for (id, data_opt) in fetched_objects {
+        if let Some(data) = data_opt {
+            let hex = id.to_hex();
+            let obj_path = dest_repo
+                .root()
+                .join("objects")
+                .join(&hex[..2])
+                .join(&hex[2..]);
+
+            // Ensure parent directory exists
+            if let Some(parent) = obj_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            // Store blob
+            let blob = Blob::new(data.clone(), false);
+            std::fs::write(&obj_path, blob.to_bytes()?)?;
+
+            objects_fetched += 1;
+            bytes_fetched += data.len() as u64;
+        }
+    }
+
+    Ok(RepairResult {
+        objects_fetched,
+        bytes_fetched,
+        objects_already_present: already_present,
     })
 }
 
-/// Simple recursive directory walker.
-fn walkdir(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    if !dir.is_dir() {
-        return Ok(files);
-    }
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            files.extend(walkdir(&path)?);
-        } else {
-            files.push(path);
-        }
-    }
-    Ok(files)
-}
-
+/// Result of a repair operation.
 #[derive(Debug)]
-pub struct CacheCleanResult {
-    pub files_removed: u64,
-    pub bytes_freed: u64,
+pub struct RepairResult {
+    pub objects_fetched: u64,
+    pub bytes_fetched: u64,
+    pub objects_already_present: u64,
 }

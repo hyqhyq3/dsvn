@@ -280,6 +280,86 @@ impl std::fmt::Display for VerifyResult {
     }
 }
 
+/// Verify sync and optionally repair by fetching missing objects from remote.
+pub async fn verify_sync_with_repair(
+    source: &SqliteRepository,
+    dest: &SqliteRepository,
+    source_url: &str,
+    rev: u64,
+    repair: bool,
+) -> Result<(VerifyResult, Option<crate::remote::RepairResult>)> {
+    let source_tree = source.get_tree_at_rev(rev)?;
+    let dest_tree = dest.get_tree_at_rev(rev)?;
+
+    let mut mismatches = Vec::new();
+    let mut missing_in_dest = Vec::new();
+    let mut extra_in_dest = Vec::new();
+
+    // Check all source entries exist in dest with same content
+    for (path, entry) in &source_tree {
+        match dest_tree.get(path) {
+            Some(dest_entry) => {
+                if entry.id != dest_entry.id {
+                    mismatches.push(path.clone());
+                }
+            }
+            None => {
+                missing_in_dest.push(path.clone());
+            }
+        }
+    }
+
+    // Check for extra entries in dest
+    for path in dest_tree.keys() {
+        if !source_tree.contains_key(path) {
+            extra_in_dest.push(path.clone());
+        }
+    }
+
+    let ok = mismatches.is_empty() && missing_in_dest.is_empty() && extra_in_dest.is_empty();
+
+    let verify_result = VerifyResult {
+        revision: rev,
+        source_entries: source_tree.len(),
+        dest_entries: dest_tree.len(),
+        mismatches,
+        missing_in_dest,
+        extra_in_dest,
+        ok,
+    };
+
+    // If repair is requested and there are missing entries, fetch from remote
+    let repair_result = if repair && !verify_result.missing_in_dest.is_empty() {
+        // Collect all object IDs from missing paths
+        let mut missing_object_ids = Vec::new();
+        for path in &verify_result.missing_in_dest {
+            if let Some(entry) = source_tree.get(path) {
+                missing_object_ids.push(entry.id);
+            }
+        }
+
+        println!("Repairing: fetching {} missing objects from {}...", 
+                 missing_object_ids.len(), source_url);
+
+        let result = crate::remote::fetch_objects_and_repair(
+            source_url, 
+            dest, 
+            &missing_object_ids
+        ).await?;
+
+        println!("  Fetched {} objects ({} bytes), {} already present",
+                 result.objects_fetched,
+                 format_size(result.bytes_fetched),
+                 result.objects_already_present);
+
+        Some(result)
+    } else {
+        None
+    };
+
+    Ok((verify_result, repair_result))
+}
+
 fn format_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;

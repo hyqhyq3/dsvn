@@ -103,6 +103,9 @@ pub struct RevisionData {
     pub properties: Vec<(String, String)>,
     /// SHA-256 hash of all object data for verification.
     pub content_hash: ObjectId,
+    /// Whether this revision has no file/directory changes.
+    /// Corresponds to SVN's --allow-empty flag in svnsync.
+    pub empty_commit: bool,
 }
 
 impl RevisionData {

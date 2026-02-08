@@ -307,6 +307,9 @@ fn build_revision_data(repo: &SqliteRepository, rev: u64) -> anyhow::Result<Revi
 
     let content_hash = RevisionData::compute_content_hash(&objects);
 
+    // Check if this is an empty commit
+    let empty_commit = delta_tree.changes.is_empty();
+
     Ok(RevisionData {
         revision: rev,
         author: commit.author,
@@ -316,6 +319,7 @@ fn build_revision_data(repo: &SqliteRepository, rev: u64) -> anyhow::Result<Revi
         objects,
         properties,
         content_hash,
+        empty_commit,
     })
 }
 

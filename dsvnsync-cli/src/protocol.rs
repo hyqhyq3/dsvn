@@ -37,7 +37,7 @@ pub fn extract_revision_data(
     let mut objects = Vec::new();
     for change in &delta_tree.changes {
         match change {
-            TreeChange::Upsert { path, entry } => {
+            TreeChange::Upsert { path: _, entry } => {
                 if entry.kind == ObjectKind::Blob {
                     // Load blob directly from object store
                     let hex = entry.id.to_hex();
@@ -65,6 +65,9 @@ pub fn extract_revision_data(
 
     let content_hash = RevisionData::compute_content_hash(&objects);
 
+    // Check if this is an empty commit (no file/directory changes)
+    let empty_commit = delta_tree.changes.is_empty();
+
     Ok(RevisionData {
         revision: rev,
         author: commit.author.clone(),
@@ -74,6 +77,7 @@ pub fn extract_revision_data(
         objects,
         properties,
         content_hash,
+        empty_commit,
     })
 }
 
@@ -81,7 +85,13 @@ pub fn extract_revision_data(
 pub fn apply_revision_data(
     repo: &SqliteRepository,
     rev_data: &RevisionData,
-) -> Result<u64> {
+    allow_empty: bool,
+) -> Result<Option<u64>> {
+    // Check if this is an empty commit and should be skipped
+    if rev_data.empty_commit && !allow_empty {
+        return Ok(None); // Skip empty commits
+    }
+
     // Verify content hash
     if !rev_data.verify_content_hash() {
         return Err(anyhow!(
@@ -145,7 +155,7 @@ pub fn apply_revision_data(
         std::fs::write(&props_path, serde_json::to_string_pretty(&props_map)?)?;
     }
 
-    Ok(new_rev)
+    Ok(Some(new_rev))
 }
 
 /// Read HEAD revision directly from disk (no async needed).
@@ -261,7 +271,11 @@ impl<'a> LocalSync<'a> {
             }
 
             // Apply to destination
-            apply_revision_data(self.dest, &rev_data)?;
+            // Get allow_empty from destination repository's sync config
+            let allow_empty = SyncConfig::load(self.dest.root())
+                .map(|config| config.allow_empty)
+                .unwrap_or(true);
+            apply_revision_data(self.dest, &rev_data, allow_empty)?;
             revisions_synced += 1;
 
             // Update checkpoint every 100 revisions
