@@ -31,7 +31,7 @@ pub use persistent::{PersistentRepository, RepositoryMetadata};
 pub use sqlite_repository::{SqliteRepository, SqlitePropertyStore};
 pub use hooks::HookManager;
 pub use storage::{HotStore, ObjectStore, Result, StorageError, TieredStore, WarmStore};
-pub use sync::{SyncState, ReplicationLog, ReplicationLogEntry};
+pub use sync::{SyncState, ReplicationLog, ReplicationLogEntry, SyncEndpointInfo, SyncConfig, RevisionSummary};
 pub use replication::{
     SyncMessage, HandshakeRequest, HandshakeResponse, SyncRequest,
     RevisionData, SyncAck, SyncComplete, Compression, RepositoryInfo,

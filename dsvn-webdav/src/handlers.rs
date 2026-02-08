@@ -62,6 +62,12 @@ fn get_repo() -> &'static Arc<SqliteRepository> {
         .expect("Repository not initialized — call init_repository() first")
 }
 
+/// Public accessor for the global repository Arc.
+/// Used by sync_handlers to access the repository.
+pub fn get_repo_arc() -> Arc<SqliteRepository> {
+    get_repo().clone()
+}
+
 const REPO_PREFIX: &str = "/svn";
 
 fn escape_xml(s: &str) -> String {

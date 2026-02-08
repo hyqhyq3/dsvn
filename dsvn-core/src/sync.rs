@@ -3,11 +3,99 @@
 //! Tracks the synchronization state between a source (master) and destination
 //! (slave) repository. Stores metadata like last synced revision, source UUID,
 //! and sync timestamps.
+//!
+//! Also provides `SyncInfo` and `SyncConfig` types used by the HTTP /sync endpoints
+//! for server-to-server replication with on-demand object fetching.
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+
+// ─────────────────────────────────────────────────────
+// HTTP sync endpoint types (used by /sync/*)
+// ─────────────────────────────────────────────────────
+
+/// Information about a repository for the /sync/info endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncEndpointInfo {
+    /// Repository UUID.
+    pub uuid: String,
+    /// Current HEAD revision.
+    pub head_rev: u64,
+    /// Protocol version for the sync API.
+    pub protocol_version: u32,
+    /// Capabilities advertised by the server.
+    pub capabilities: Vec<String>,
+}
+
+/// Sync configuration stored at `repo/sync-config.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncConfig {
+    /// Whether sync endpoints are enabled.
+    pub enabled: bool,
+    /// Optional cache directory for fetched objects.
+    pub cache_dir: Option<PathBuf>,
+    /// Maximum age (in hours) for cached objects before eviction.
+    pub max_cache_age_hours: u32,
+    /// Whether authentication is required for sync endpoints.
+    pub require_auth: bool,
+    /// Allowed source patterns (`["*"]` means allow all).
+    #[serde(default = "default_allowed_sources")]
+    pub allowed_sources: Vec<String>,
+}
+
+fn default_allowed_sources() -> Vec<String> {
+    vec!["*".to_string()]
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cache_dir: None,
+            max_cache_age_hours: 720, // 30 days
+            require_auth: false,
+            allowed_sources: default_allowed_sources(),
+        }
+    }
+}
+
+impl SyncConfig {
+    /// Load sync config from a repository path.
+    pub fn load(repo_path: &Path) -> Result<Self> {
+        let config_path = repo_path.join("sync-config.json");
+        if !config_path.exists() {
+            return Ok(Self::default());
+        }
+        let data = fs::read_to_string(&config_path)
+            .with_context(|| format!("Failed to read sync config from {:?}", config_path))?;
+        let config: SyncConfig = serde_json::from_str(&data)
+            .with_context(|| "Failed to parse sync config JSON")?;
+        Ok(config)
+    }
+
+    /// Save sync config to a repository path.
+    pub fn save(&self, repo_path: &Path) -> Result<()> {
+        let config_path = repo_path.join("sync-config.json");
+        let tmp_path = config_path.with_extension("tmp");
+        let data = serde_json::to_string_pretty(self)?;
+        fs::write(&tmp_path, &data)?;
+        fs::rename(&tmp_path, &config_path)?;
+        Ok(())
+    }
+}
+
+/// Summary of a single revision for the /sync/revs endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevisionSummary {
+    pub rev: u64,
+    pub author: String,
+    pub message: String,
+    pub timestamp: i64,
+    /// Number of changes (adds + deletes) in this revision.
+    pub change_count: usize,
+}
 
 /// Synchronization state persisted in the destination repository.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -554,6 +554,28 @@ impl SqliteRepository {
     pub async fn exists(&self, path: &str, rev: u64) -> Result<bool> {
         Ok(self.get_file(path, rev).await.is_ok())
     }
+
+    // ==================== Sync Endpoint Helpers ====================
+
+    /// Load raw object bytes by ObjectId. Returns the on-disk blob bytes.
+    pub fn load_object_raw(&self, id: &ObjectId) -> Result<Vec<u8>> {
+        self.load_object(id)
+    }
+
+    /// Check whether an object exists in the store.
+    pub fn has_object(&self, id: &ObjectId) -> bool {
+        self.object_path(id).exists()
+    }
+
+    /// Load a DeltaTree for a given revision (public accessor).
+    pub fn get_delta_tree(&self, rev: u64) -> Result<DeltaTree> {
+        self.load_delta_tree(rev)
+    }
+
+    /// Load a Commit for a given revision (public sync accessor, synchronous).
+    pub fn get_commit_sync(&self, rev: u64) -> Result<Commit> {
+        self.load_commit(rev)
+    }
 }
 
 #[cfg(test)]

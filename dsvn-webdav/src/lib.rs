@@ -4,9 +4,10 @@
 
 pub mod handlers;
 pub mod proppatch;
+pub mod sync_handlers;
 pub mod xml;
 
-pub use handlers::{report_handler, propfind_handler, options_handler, init_repository, init_repository_async};
+pub use handlers::{report_handler, propfind_handler, options_handler, init_repository, init_repository_async, get_repo_arc};
 
 use hyper::{body::Incoming, Request, Response};
 use http_body_util::{BodyExt, Full};
@@ -61,6 +62,40 @@ impl WebDavHandler {
         let uri = req.uri().clone();
 
         tracing::debug!("WebDAV request: {} {}", method, uri);
+
+        // ── Sync endpoints (/sync/*) ──
+        let path = uri.path();
+        if path.starts_with("/sync/") || path == "/sync" {
+            let sync_path = path.strip_prefix("/sync").unwrap_or("");
+            let query = uri.query().unwrap_or("");
+            let method_str = method.as_str();
+
+            // Read body for POST
+            let body_bytes = if method_str == "POST" {
+                match req.into_body().collect().await {
+                    Ok(c) => c.to_bytes().to_vec(),
+                    Err(e) => {
+                        return Ok(Response::builder()
+                            .status(400)
+                            .body(Full::new(Bytes::from(format!("Bad request: {}", e))))
+                            .unwrap());
+                    }
+                }
+            } else {
+                let _ = req.into_body();
+                vec![]
+            };
+
+            let repo = handlers::get_repo_arc();
+            return Ok(sync_handlers::handle_sync_request(
+                sync_path,
+                method_str,
+                &body_bytes,
+                query,
+                &repo,
+            )
+            .await);
+        }
 
         // Route to appropriate handler
         match method.as_str() {

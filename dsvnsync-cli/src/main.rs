@@ -8,6 +8,7 @@
 
 mod compat;
 mod protocol;
+mod remote;
 mod replication_log;
 mod transfer;
 
@@ -97,6 +98,40 @@ enum Commands {
         #[arg(short, long)]
         dest: String,
     },
+
+    /// Pull from a remote HTTP dsvn server
+    Pull {
+        /// Remote server URL (e.g. http://server:8080)
+        #[arg(short, long)]
+        source: String,
+        /// Local repository path
+        #[arg(short, long)]
+        dest: String,
+        /// Optional cache directory for objects
+        #[arg(long)]
+        cache: Option<String>,
+        /// Initialize sync relationship first (if not already done)
+        #[arg(long)]
+        init: bool,
+    },
+
+    /// Show remote server sync info
+    #[command(name = "remote-info")]
+    RemoteInfo {
+        /// Remote server URL (e.g. http://server:8080)
+        url: String,
+    },
+
+    /// Clean expired objects from sync cache
+    #[command(name = "cache-clean")]
+    CacheClean {
+        /// Cache directory
+        #[arg(short, long)]
+        cache_dir: String,
+        /// Maximum age in hours (default: 720 = 30 days)
+        #[arg(long, default_value = "720")]
+        max_age_hours: u32,
+    },
 }
 
 #[tokio::main]
@@ -127,6 +162,12 @@ async fn main() -> Result<()> {
             cmd_svnsync_init(source, dest).await,
         Commands::SvnSyncSync { source, dest } =>
             cmd_svnsync_sync(source, dest).await,
+        Commands::Pull { source, dest, cache, init } =>
+            cmd_pull(source, dest, cache, init).await,
+        Commands::RemoteInfo { url } =>
+            cmd_remote_info(url).await,
+        Commands::CacheClean { cache_dir, max_age_hours } =>
+            cmd_cache_clean(cache_dir, max_age_hours).await,
     }
 }
 
@@ -367,6 +408,92 @@ async fn cmd_svnsync_sync(source: String, dest: String) -> Result<()> {
 
     compat.release_lock()?;
     println!("Released sync lock.");
+    Ok(())
+}
+
+async fn cmd_pull(source: String, dest: String, cache: Option<String>, init: bool) -> Result<()> {
+    let dest_path = Path::new(&dest);
+
+    // Create destination repo if it doesn't exist
+    let dest_repo = SqliteRepository::open(dest_path)?;
+    dest_repo.initialize().await?;
+    drop(dest_repo); // release before RemotePull takes over
+
+    let cache_dir = cache.map(|c| std::path::PathBuf::from(c));
+    let puller = remote::RemotePull::new(&source, dest_path, cache_dir);
+
+    // Auto-init if requested
+    if init || dsvn_core::SyncState::load(dest_path)?.is_none() {
+        println!("Initializing sync relationship with {}...", source);
+        let state = puller.init().await?;
+        println!("  Source UUID:  {}", state.source_uuid);
+        println!("  Source HEAD:  r{}", state.source_head_rev);
+        println!();
+    }
+
+    println!("Pulling from {}...", source);
+    let result = puller.pull().await?;
+
+    if result.already_up_to_date {
+        println!("Already up to date.");
+        return Ok(());
+    }
+
+    println!("\nPull completed:");
+    println!("  Revisions: r{} → r{}", result.from_rev, result.to_rev);
+    println!("  Synced:    {} revisions", result.revisions_synced);
+    println!("  Objects:   {} transferred, {} from cache/existing",
+             result.objects_transferred, result.objects_cached);
+    println!("  Bytes:     {}", format_size(result.bytes_transferred));
+    println!("  Time:      {}ms", result.duration_ms);
+    if result.duration_ms > 0 {
+        let rev_per_sec = (result.revisions_synced as f64 / result.duration_ms as f64) * 1000.0;
+        println!("  Speed:     {:.1} revisions/sec", rev_per_sec);
+    }
+
+    Ok(())
+}
+
+async fn cmd_remote_info(url: String) -> Result<()> {
+    let client = remote::RemoteSyncClient::new(&url);
+
+    println!("Querying remote server: {}", url);
+    let info = client.get_info().await?;
+
+    println!("\nRemote Repository:");
+    println!("  UUID:             {}", info.uuid);
+    println!("  HEAD revision:    r{}", info.head_rev);
+    println!("  Protocol version: {}", info.protocol_version);
+    println!("  Capabilities:     {}", info.capabilities.join(", "));
+
+    // Also fetch config if available
+    match client.get_config().await {
+        Ok(config) => {
+            println!("\nSync Configuration:");
+            println!("  Enabled:          {}", config.enabled);
+            println!("  Require auth:     {}", config.require_auth);
+            println!("  Max cache age:    {} hours", config.max_cache_age_hours);
+            println!("  Allowed sources:  {}", config.allowed_sources.join(", "));
+            if let Some(ref cache_dir) = config.cache_dir {
+                println!("  Cache dir:        {}", cache_dir.display());
+            }
+        }
+        Err(e) => {
+            println!("\n  (Could not fetch sync config: {})", e);
+        }
+    }
+
+    Ok(())
+}
+
+async fn cmd_cache_clean(cache_dir: String, max_age_hours: u32) -> Result<()> {
+    let path = Path::new(&cache_dir);
+    println!("Cleaning cache: {}", cache_dir);
+    println!("  Max age: {} hours", max_age_hours);
+
+    let result = remote::clean_cache(path, max_age_hours)?;
+    println!("  Files removed: {}", result.files_removed);
+    println!("  Bytes freed:   {}", format_size(result.bytes_freed));
     Ok(())
 }
 
