@@ -12,16 +12,17 @@ use dsvn_core::{
 };
 use std::collections::HashMap;
 
-/// Extract RevisionData for a specific revision from a repository.
-/// This is the core function that prepares data for transfer.
+/// Extract RevisionData synchronously from a repository.
+/// Reads commit and object data directly from disk.
 pub fn extract_revision_data(
     repo: &SqliteRepository,
     rev: u64,
 ) -> Result<RevisionData> {
-    let rt = tokio::runtime::Handle::current();
-    let commit = rt
-        .block_on(repo.get_commit(rev))
-        .ok_or_else(|| anyhow!("Commit for revision {} not found", rev))?;
+    // Load commit directly from disk
+    let commit_path = repo.root().join("commits").join(format!("{}.bin", rev));
+    let commit_data = std::fs::read(&commit_path)
+        .map_err(|_| anyhow!("Commit for revision {} not found", rev))?;
+    let commit: dsvn_core::Commit = bincode::deserialize(&commit_data)?;
 
     // Load delta tree
     let delta_path = repo.root().join("tree_deltas").join(format!("{}.bin", rev));
@@ -29,7 +30,6 @@ pub fn extract_revision_data(
         let data = std::fs::read(&delta_path)?;
         bincode::deserialize::<DeltaTree>(&data)?
     } else {
-        // Fallback: compute delta from tree diff
         DeltaTree::new(if rev > 0 { rev - 1 } else { 0 }, vec![], 0)
     };
 
@@ -39,14 +39,17 @@ pub fn extract_revision_data(
         match change {
             TreeChange::Upsert { path, entry } => {
                 if entry.kind == ObjectKind::Blob {
-                    if let Ok(content) = rt.block_on(repo.get_file(&format!("/{}", path), rev)) {
-                        objects.push((entry.id, content.to_vec()));
+                    // Load blob directly from object store
+                    let hex = entry.id.to_hex();
+                    let obj_path = repo.root().join("objects").join(&hex[..2]).join(&hex[2..]);
+                    if let Ok(raw) = std::fs::read(&obj_path) {
+                        if let Ok(blob) = Blob::deserialize(&raw) {
+                            objects.push((entry.id, blob.data));
+                        }
                     }
                 }
             }
-            TreeChange::Delete { .. } => {
-                // No objects needed for deletes
-            }
+            TreeChange::Delete { .. } => {}
         }
     }
 
@@ -100,7 +103,6 @@ pub fn apply_revision_data(
             if let Some(parent) = obj_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            // Store as blob
             let blob = Blob::new(data.clone(), false);
             std::fs::write(&obj_path, blob.to_bytes()?)?;
         }
@@ -111,12 +113,10 @@ pub fn apply_revision_data(
         match change {
             TreeChange::Upsert { path, entry } => {
                 if entry.kind == ObjectKind::Blob {
-                    // Find the object data
                     if let Some((_, data)) = rev_data.objects.iter().find(|(id, _)| *id == entry.id)
                     {
                         repo.add_file_sync(path, data.clone(), entry.mode == 0o755)?;
                     } else {
-                        // Object might already exist in dest repo
                         repo.add_file_sync(path, vec![], entry.mode == 0o755)?;
                     }
                 } else {
@@ -148,7 +148,21 @@ pub fn apply_revision_data(
     Ok(new_rev)
 }
 
+/// Read HEAD revision directly from disk (no async needed).
+fn read_head_rev(repo: &SqliteRepository) -> u64 {
+    let head_path = repo.root().join("refs").join("head");
+    if head_path.exists() {
+        std::fs::read_to_string(&head_path)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    } else {
+        0
+    }
+}
+
 /// Perform a full sync between source and destination repositories (local-to-local).
+/// All methods are synchronous to avoid async/sync conflicts with `commit_sync`.
 pub struct LocalSync<'a> {
     pub source: &'a SqliteRepository,
     pub dest: &'a SqliteRepository,
@@ -161,8 +175,6 @@ impl<'a> LocalSync<'a> {
 
     /// Initialize sync: set up sync state on the destination.
     pub fn init(&self) -> Result<SyncState> {
-        let rt = tokio::runtime::Handle::current();
-
         // Check if already initialized
         if let Some(existing) = SyncState::load(self.dest.root())? {
             return Err(anyhow!(
@@ -173,31 +185,37 @@ impl<'a> LocalSync<'a> {
 
         let source_uuid = self.source.uuid().to_string();
         let source_url = format!("file://{}", self.source.root().display());
-        let source_head = rt.block_on(self.source.current_rev());
+        let source_head = read_head_rev(self.source);
 
         let mut state = SyncState::new(source_uuid, source_url);
         state.source_head_rev = source_head;
         state.save(self.dest.root())?;
 
-        // Set SVN-compatible sync properties
-        let dest_props = self.dest.property_store();
-        rt.block_on(dest_props.set(
-            "/:rev0".to_string(),
+        // Set SVN-compatible sync properties as revprops on rev 0
+        let revprops_dir = self.dest.root().join("revprops");
+        std::fs::create_dir_all(&revprops_dir)?;
+        let revprops_path = revprops_dir.join("0.json");
+        let mut props: HashMap<String, String> = if revprops_path.exists() {
+            let data = std::fs::read_to_string(&revprops_path)?;
+            serde_json::from_str(&data).unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+        props.insert(
             dsvn_core::sync::svn_sync_props::SYNC_FROM_URL.to_string(),
             format!("file://{}", self.source.root().display()),
-        ))?;
-        rt.block_on(dest_props.set(
-            "/:rev0".to_string(),
+        );
+        props.insert(
             dsvn_core::sync::svn_sync_props::SYNC_FROM_UUID.to_string(),
             self.source.uuid().to_string(),
-        ))?;
+        );
+        std::fs::write(&revprops_path, serde_json::to_string_pretty(&props)?)?;
 
         Ok(state)
     }
 
     /// Perform incremental sync.
     pub fn sync(&self) -> Result<SyncResult> {
-        let rt = tokio::runtime::Handle::current();
         let start_time = std::time::Instant::now();
 
         let mut state = SyncState::load(self.dest.root())?
@@ -206,8 +224,7 @@ impl<'a> LocalSync<'a> {
         // Verify source UUID
         state.verify_source(self.source.uuid())?;
 
-        let source_head = rt.block_on(self.source.current_rev());
-        let _dest_rev = rt.block_on(self.dest.current_rev());
+        let source_head = read_head_rev(self.source);
         let from_rev = state.effective_start_rev() + 1;
 
         if from_rev > source_head {
@@ -285,11 +302,10 @@ impl<'a> LocalSync<'a> {
 
     /// Get sync information.
     pub fn info(&self) -> Result<SyncInfo> {
-        let rt = tokio::runtime::Handle::current();
         let state = SyncState::load(self.dest.root())?;
         let repl_log = ReplicationLog::new(self.dest.root());
         let latest_entry = repl_log.latest()?;
-        let dest_rev = rt.block_on(self.dest.current_rev());
+        let dest_rev = read_head_rev(self.dest);
 
         Ok(SyncInfo {
             state,

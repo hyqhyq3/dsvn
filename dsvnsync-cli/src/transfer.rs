@@ -104,12 +104,8 @@ pub fn transfer_revisions(
     to_rev: u64,
     progress_callback: Option<&dyn Fn(u64, u64)>,
 ) -> Result<TransferStats> {
-    let _rt = tokio::runtime::Handle::current();
     let start = std::time::Instant::now();
     let mut stats = TransferStats::default();
-
-    // Collect all known object IDs at destination for dedup
-    // (For large repos, we use path-based existence checks instead)
 
     dest.begin_batch();
 
