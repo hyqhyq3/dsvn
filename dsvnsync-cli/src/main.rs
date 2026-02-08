@@ -54,18 +54,6 @@ enum Commands {
         repo: String,
     },
 
-    /// Verify sync integrity between source and destination
-    Verify {
-        #[arg(short, long)]
-        source: String,
-        #[arg(short, long)]
-        dest: String,
-        #[arg(short = 'r', long)]
-        revision: Option<u64>,
-        #[arg(short = 't', long)]
-        transfer: bool,
-    },
-
     /// View replication log
     #[command(name = "repl-log")]
     ReplLog {
@@ -140,8 +128,6 @@ async fn main() -> Result<()> {
             cmd_sync(source, dest, verify).await,
         Commands::Info { repo } =>
             cmd_info(repo).await,
-        Commands::Verify { source, dest, revision, transfer } =>
-            cmd_verify(source, dest, revision, transfer).await,
         Commands::ReplLog { repo, from, to } =>
             cmd_repl_log(repo, from, to).await,
         Commands::Cleanup { repo, remove_hooks } =>
@@ -288,53 +274,6 @@ async fn cmd_info(repo: String) -> Result<()> {
 
     Ok(())
 }
-
-async fn cmd_verify(source: String, dest: String, revision: Option<u64>, transfer: bool) -> Result<()> {
-    let source_repo = SqliteRepository::open(Path::new(&source))?;
-    source_repo.initialize().await?;
-    let dest_repo = SqliteRepository::open(Path::new(&dest))?;
-    dest_repo.initialize().await?;
-
-    let rev = match revision {
-        Some(r) => r,
-        None => dest_repo.current_rev().await,
-    };
-
-    println!("Verifying sync at revision {}...", rev);
-    if transfer {
-        println!("Transfer mode enabled: will fetch missing objects from source");
-        println!();
-
-        let (result, repair_result) = transfer::verify_sync_with_repair(
-            &source_repo, 
-            &dest_repo, 
-            &source, 
-            rev, 
-            true
-        ).await?;
-
-        print!("{}", result);
-
-        if let Some(repair) = repair_result {
-            println!("\nRepair summary:");
-            println!("  Objects fetched:  {}", repair.objects_fetched);
-            println!("  Bytes fetched:    {}", format_size(repair.bytes_fetched));
-            println!("  Already present:   {}", repair.objects_already_present);
-        }
-
-        if !result.ok {
-            return Err(anyhow!("Verification failed! (some issues could not be repaired)"));
-        }
-    } else {
-        let result = transfer::verify_sync(&source_repo, &dest_repo, rev)?;
-        print!("{}", result);
-        if !result.ok {
-            return Err(anyhow!("Verification failed!"));
-        }
-    }
-    Ok(())
-}
-
 
 async fn cmd_repl_log(repo: String, from: Option<u64>, to: Option<u64>) -> Result<()> {
     replication_log::print_repl_log(Path::new(&repo), from, to, &mut std::io::stdout())?;

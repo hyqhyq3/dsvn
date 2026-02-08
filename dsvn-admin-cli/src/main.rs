@@ -3,6 +3,7 @@
 mod dump;
 mod dump_format;
 mod load;
+mod verify_mod;
 
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
@@ -57,6 +58,9 @@ enum Commands {
         end: Option<u64>,
         #[arg(short, long)]
         quiet: bool,
+        /// Transfer missing objects from remote server (HTTP URL)
+        #[arg(long)]
+        transfer: Option<String>,
     },
 
     /// Display repository information
@@ -443,58 +447,8 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
-        Commands::Verify { repo, start, end, quiet } => {
-            let repository = SqliteRepository::open(Path::new(&repo))?;
-            repository.initialize().await?;
-            let head = repository.current_rev().await;
-            let start_rev = start.unwrap_or(0);
-            let end_rev = end.unwrap_or(head).min(head);
-            if !quiet { println!("Verifying repository: {}\n  Revisions: {} to {}\n", repo, start_rev, end_rev); }
-            let mut errors = 0u64;
-            let mut warnings = 0u64;
-            let mut verified_revs = 0u64;
-            let mut verified_objects = 0u64;
-            for rev in start_rev..=end_rev {
-                match repository.get_commit(rev).await {
-                    Some(commit) => {
-                        verified_objects += 1;
-                        if commit.author.is_empty() && rev > 0 { warnings += 1; if !quiet { eprintln!("  WARNING: r{} has empty author", rev); } }
-                        match repository.get_tree_at_rev(rev) {
-                            Ok(tree_map) => {
-                                verified_objects += 1;
-                                for (path, entry) in &tree_map {
-                                    if entry.kind == dsvn_core::ObjectKind::Blob {
-                                        match repository.get_file(&format!("/{}", path), rev).await {
-                                            Ok(_) => { verified_objects += 1; }
-                                            Err(e) => { errors += 1; eprintln!("  ERROR: r{} object missing for '{}': {}", rev, path, e); }
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => { errors += 1; eprintln!("  ERROR: r{} tree reconstruction failed: {}", rev, e); }
-                        }
-                        if rev > 0 {
-                            match load_delta_tree(&repository, rev) {
-                                Ok(_) => { verified_objects += 1; }
-                                Err(_) => { warnings += 1; if !quiet { eprintln!("  WARNING: r{} has no delta tree (legacy format?)", rev); } }
-                            }
-                        }
-                    }
-                    None => { errors += 1; eprintln!("  ERROR: r{} commit not found", rev); }
-                }
-                verified_revs += 1;
-                if !quiet && (rev % 100 == 0 || rev == end_rev) {
-                    eprint!("\r  Verified: r{}/{} ({} objects, {} errors)    ", rev, end_rev, verified_objects, errors);
-                }
-            }
-            if !quiet { eprintln!(); }
-            println!("\nVerification complete:");
-            println!("  Revisions verified: {}", verified_revs);
-            println!("  Objects verified:   {}", verified_objects);
-            println!("  Errors:             {}", errors);
-            println!("  Warnings:           {}", warnings);
-            if errors > 0 { Err(anyhow!("Repository verification failed with {} error(s)", errors)) }
-            else { println!("  Status:             OK ✓"); Ok(()) }
+        Commands::Verify { repo, start, end, quiet, transfer } => {
+            verify_mod::verify_repository(&repo, start, end, quiet, transfer).await
         }
 
         Commands::Info { repo } => {
