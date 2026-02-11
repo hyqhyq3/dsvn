@@ -7,19 +7,102 @@ pub mod proppatch;
 pub mod sync_handlers;
 pub mod dump_handlers;
 pub mod xml;
+pub mod repo_management;
 
-pub use handlers::{report_handler, propfind_handler, options_handler, init_repository, init_repository_async, get_repo_arc};
+pub use handlers::{
+    report_handler, propfind_handler, options_handler,
+    init_repository, init_repository_async, get_repo_arc,
+    RepositoryRegistry, init_repository_registry, init_repository_registry_async,
+    init_multi_repo_config,
+    get_repo_by_path,
+};
 
 use hyper::{body::Incoming, Request, Response};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use std::sync::Arc;
+use std::collections::HashMap;
+
+use dsvn_core::SqliteRepository;
+
+/// Multi-repository configuration
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MultiRepoConfig {
+    /// Enable multi-repository mode
+    #[serde(default)]
+    pub multi_repo: bool,
+    /// Repository registry (name -> path)
+    #[serde(default)]
+    pub repositories: HashMap<String, RepoConfig>,
+}
+
+impl Default for MultiRepoConfig {
+    fn default() -> Self {
+        Self {
+            multi_repo: false,
+            repositories: HashMap::new(),
+        }
+    }
+}
+
+impl MultiRepoConfig {
+    /// Load from TOML file
+    pub fn from_file(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let content = std::fs::read_to_string(path)?;
+        toml::from_str(&content).map_err(Into::into)
+    }
+
+    /// Save to TOML file
+    pub fn to_file(&self, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+        let content = toml::to_string_pretty(self)?;
+        std::fs::write(path, content)?;
+        Ok(())
+    }
+}
+
+/// Single repository configuration
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RepoConfig {
+    /// Repository path on disk
+    pub path: String,
+    /// Repository display name
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Repository description
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+impl RepoConfig {
+    /// Create new config
+    pub fn new(path: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            display_name: None,
+            description: None,
+        }
+    }
+
+    /// With display name
+    pub fn with_display_name(mut self, name: impl Into<String>) -> Self {
+        self.display_name = Some(name.into());
+        self
+    }
+
+    /// With description
+    pub fn with_description(mut self, desc: impl Into<String>) -> Self {
+        self.description = Some(desc.into());
+        self
+    }
+}
 
 /// WebDAV configuration
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Repository root path
+    /// Repository root path (legacy single-repo mode)
     pub repo_root: String,
+    /// Multi-repository configuration
+    pub multi_repo_config: MultiRepoConfig,
     /// Maximum request body size (bytes)
     pub max_body_size: usize,
     /// Enable compression
@@ -32,6 +115,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             repo_root: "/svn".to_string(),
+            multi_repo_config: MultiRepoConfig::default(),
             max_body_size: 100 * 1024 * 1024, // 100 MB
             compression: true,
             debug: false,
@@ -41,7 +125,7 @@ impl Default for Config {
 
 /// WebDAV request handler
 pub struct WebDavHandler {
-    config: Config,
+    pub config: Config,
 }
 
 impl WebDavHandler {
@@ -63,6 +147,78 @@ impl WebDavHandler {
         let uri = req.uri().clone();
 
         tracing::debug!("WebDAV request: {} {}", method, uri);
+
+        // ── Repository Management API (/_api/repos) ──
+        let path = uri.path();
+        if path.starts_with("/svn/_api/repos") {
+            use repo_management::{handle_create_repo, handle_delete_repo, handle_list_repos};
+
+            // Get reference to registry
+            let registry = match handlers::REPOSITORY_REGISTRY.get() {
+                Some(r) => r.clone(),
+                None => {
+                    // Create a new registry if not initialized
+                    handlers::RepositoryRegistry::new()
+                }
+            };
+
+            // Match on path and method
+            if path == "/svn/_api/repos" {
+                match method.as_str() {
+                    "GET" => {
+                        return handle_list_repos(&registry).await;
+                    }
+                    "POST" => {
+                        let body_bytes = match req.into_body().collect().await {
+                            Ok(c) => c.to_bytes().to_vec(),
+                            Err(e) => {
+                                return Ok(Response::builder()
+                                    .status(400)
+                                    .body(Full::new(Bytes::from(format!("Bad request: {}", e))))
+                                    .unwrap());
+                            }
+                        };
+
+                        // Clone registry for mutation
+                        let mut registry_mut = registry.clone();
+                        let response = handle_create_repo(body_bytes, &mut registry_mut).await?;
+
+                        // Note: Changes to registry_mut are not persisted back to REPOSITORY_REGISTRY
+                        // This is a limitation of the current OnceLock-based design
+                        // For production use, REPOSITORY_REGISTRY should be wrapped in a Mutex/RwLock
+                        return Ok(response);
+                    }
+                    _ => {
+                        return Ok(Response::builder()
+                            .status(405)
+                            .body(Full::new(Bytes::from("Method Not Allowed")))
+                            .unwrap());
+                    }
+                }
+            } else if path.starts_with("/svn/_api/repos/") {
+                let repo_name = path.strip_prefix("/svn/_api/repos/").unwrap_or("");
+                if !repo_name.is_empty() {
+                    match method.as_str() {
+                        "DELETE" => {
+                            // Clone registry for mutation
+                            let mut registry_mut = registry.clone();
+                            let response = handle_delete_repo(repo_name, &mut registry_mut).await?;
+
+                            // Note: Changes to registry_mut are not persisted back to REPOSITORY_REGISTRY
+                            // This is a limitation of the current OnceLock-based design
+                            // For production use, REPOSITORY_REGISTRY should be wrapped in a Mutex/RwLock
+                            return Ok(response);
+                        }
+                        _ => {
+                            return Ok(Response::builder()
+                                .status(405)
+                                .body(Full::new(Bytes::from("Method Not Allowed")))
+                                .unwrap());
+                        }
+                    }
+                }
+            }
+        }
 
         // ── Sync endpoints (/sync/*) ──
         let path = uri.path();

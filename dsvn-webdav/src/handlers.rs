@@ -23,6 +23,86 @@ struct Transaction {
 
 static SQLITE_REPO: OnceLock<Arc<SqliteRepository>> = OnceLock::new();
 
+/// Repository registry for multi-repository support
+pub static REPOSITORY_REGISTRY: OnceLock<RepositoryRegistry> = OnceLock::new();
+
+/// Multi-repository configuration (for display names, descriptions, etc.)
+pub static MULTI_REPO_CONFIG: OnceLock<Arc<std::collections::HashMap<String, crate::RepoConfig>>> = OnceLock::new();
+
+/// Repository registry for multi-repository mode
+#[derive(Clone)]
+pub struct RepositoryRegistry {
+    repositories: HashMap<String, Arc<SqliteRepository>>,
+    names: HashMap<String, String>, // repo_path -> repo_name
+}
+
+impl Default for RepositoryRegistry {
+    fn default() -> Self {
+        Self {
+            repositories: HashMap::new(),
+            names: HashMap::new(),
+        }
+    }
+}
+
+impl RepositoryRegistry {
+    /// Create new registry
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a repository
+    pub fn register(&mut self, name: &str, repo: Arc<SqliteRepository>) -> Result<(), String> {
+        let path = repo.root().to_string_lossy().to_string();
+        if self.repositories.contains_key(name) {
+            return Err(format!("Repository '{}' already registered", name));
+        }
+        self.repositories.insert(name.to_string(), repo.clone());
+        self.names.insert(path, name.to_string());
+        Ok(())
+    }
+
+    /// Get repository by name
+    pub fn get(&self, name: &str) -> Option<Arc<SqliteRepository>> {
+        self.repositories.get(name).cloned()
+    }
+
+    /// Get repository name by path
+    pub fn get_name_by_path(&self, path: &str) -> Option<&str> {
+        self.names.get(path).map(|s| s.as_str())
+    }
+
+    /// List all repository names
+    pub fn list(&self) -> Vec<&str> {
+        self.repositories.keys().map(|s| s.as_str()).collect()
+    }
+
+    /// Check if multi-repo mode
+    pub fn is_multi_repo(&self) -> bool {
+        self.repositories.len() > 1
+    }
+
+    /// Get the default (legacy) repository
+    pub fn get_default(&self) -> Option<Arc<SqliteRepository>> {
+        if self.repositories.len() == 1 {
+            self.repositories.values().next().cloned()
+        } else {
+            SQLITE_REPO.get().cloned()
+        }
+    }
+
+    /// Unregister a repository
+    pub fn unregister(&mut self, name: &str) -> Result<(), String> {
+        if let Some(repo) = self.repositories.remove(name) {
+            let path = repo.root().to_string_lossy().to_string();
+            self.names.remove(&path);
+            Ok(())
+        } else {
+            Err(format!("Repository '{}' not found", name))
+        }
+    }
+}
+
 lazy_static::lazy_static! {
     static ref TRANSACTIONS: Arc<RwLock<HashMap<String, Transaction>>> = {
         Arc::new(RwLock::new(HashMap::new()))
@@ -37,7 +117,8 @@ lazy_static::lazy_static! {
     };
 }
 
-/// Initialize the global SQLite repository. Must be called once at server startup.
+/// Initialize the global SQLite repository (legacy single-repo mode).
+/// Must be called once at server startup.
 pub fn init_repository(repo_root: &Path) -> Result<(), String> {
     let repo = SqliteRepository::open(repo_root)
         .map_err(|e| format!("Failed to open repository at {:?}: {}", repo_root, e))?;
@@ -47,7 +128,23 @@ pub fn init_repository(repo_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Initialize the repository asynchronously (creates initial commit if needed)
+/// Initialize the repository registry for multi-repository mode.
+pub fn init_repository_registry(registry: RepositoryRegistry) -> Result<(), String> {
+    REPOSITORY_REGISTRY
+        .set(registry)
+        .map_err(|_| "Repository registry already initialized".to_string())?;
+    Ok(())
+}
+
+/// Initialize the multi-repository configuration (for display names, etc.).
+pub fn init_multi_repo_config(config: Arc<std::collections::HashMap<String, crate::RepoConfig>>) -> Result<(), String> {
+    MULTI_REPO_CONFIG
+        .set(config)
+        .map_err(|_| "Multi-repo configuration already initialized".to_string())?;
+    Ok(())
+}
+
+/// Initialize the repository asynchronously (creates initial commit if needed).
 pub async fn init_repository_async() -> Result<(), String> {
     let repo = get_repo();
     repo.initialize()
@@ -56,10 +153,55 @@ pub async fn init_repository_async() -> Result<(), String> {
     Ok(())
 }
 
+/// Initialize all repositories in the registry asynchronously.
+pub async fn init_repository_registry_async() -> Result<(), String> {
+    if let Some(registry) = REPOSITORY_REGISTRY.get() {
+        for name in registry.list() {
+            let repo_arc = registry.get(name).unwrap();
+            repo_arc.initialize()
+                .await
+                .map_err(|e| format!("Failed to initialize repository '{}': {}", name, e))?;
+        }
+    } else {
+        // Fallback to legacy single-repo mode
+        let repo = get_repo();
+        repo.initialize()
+            .await
+            .map_err(|e| format!("Failed to initialize repository: {}", e))?;
+    }
+    Ok(())
+}
+
 fn get_repo() -> &'static Arc<SqliteRepository> {
     SQLITE_REPO
         .get()
         .expect("Repository not initialized — call init_repository() first")
+}
+
+/// Get repository by request path.
+/// In multi-repo mode, extracts the repo name from the first path segment.
+pub fn get_repo_by_path(path: &str) -> Result<Arc<SqliteRepository>, String> {
+    // Strip /svn prefix if present
+    let path = path.strip_prefix("/svn").unwrap_or(path);
+
+    // Try to extract repo name from path (e.g., /repo1/... -> repo1)
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    
+    if let Some(registry) = REPOSITORY_REGISTRY.get() {
+        if !parts.is_empty() {
+            let repo_name = parts[0];
+            if let Some(repo) = registry.get(repo_name) {
+                return Ok(repo);
+            }
+        }
+        // Use default repo if available
+        if let Some(repo) = registry.get_default() {
+            return Ok(repo);
+        }
+    }
+    
+    // Fallback to legacy single-repo mode
+    Ok(get_repo().clone())
 }
 
 /// Public accessor for the global repository Arc.
@@ -208,7 +350,8 @@ fn decode_svndiff(data: &[u8]) -> Vec<u8> {
 // ==================== OPTIONS ====================
 
 pub async fn options_handler(req: Request<Incoming>, _config: &Config) -> Result<Response<Full<Bytes>>, WebDavError> {
-    let repo = get_repo();
+    let path = req.uri().path().to_string();
+    let repo = get_repo_by_path(&path).map_err(|e| WebDavError::Internal(e))?;
     let body = req.into_body().collect().await.ok();
     let body_bytes = body.map(|b| b.to_bytes()).unwrap_or_default();
     let body_str = String::from_utf8_lossy(&body_bytes);
@@ -258,8 +401,8 @@ pub async fn options_handler(req: Request<Incoming>, _config: &Config) -> Result
 // ==================== POST (create-txn) ====================
 
 pub async fn post_handler(req: Request<Incoming>, _config: &Config) -> Result<Response<Full<Bytes>>, WebDavError> {
-    let repo = get_repo();
     let path = req.uri().path().to_string();
+    let repo = get_repo_by_path(&path).map_err(|e| WebDavError::Internal(e))?;
     let body = match req.into_body().collect().await {
         Ok(c) => c.to_bytes(),
         Err(e) => return Ok(Response::builder().status(400).body(Full::new(Bytes::from(format!("Failed: {}", e)))).unwrap()),
@@ -290,9 +433,15 @@ pub async fn post_handler(req: Request<Incoming>, _config: &Config) -> Result<Re
 // ==================== PROPFIND ====================
 
 pub async fn propfind_handler(req: Request<Incoming>, _config: &Config) -> Result<Response<Full<Bytes>>, WebDavError> {
-    let repo = get_repo();
     let path = req.uri().path().to_string();
     let _ = req.into_body().collect().await;
+
+    // Handle multi-repository listing at repository root
+    if is_repository_root(&path) && REPOSITORY_REGISTRY.get().is_some() {
+        return handle_repository_root_propfind().await;
+    }
+
+    let repo = get_repo_by_path(&path).map_err(|e| WebDavError::Internal(e))?;
     let current_rev = repo.current_rev().await;
     let uuid = repo.uuid().to_string();
     if path.contains("!svn/") {
@@ -327,6 +476,59 @@ r#"<?xml version="1.0" encoding="utf-8"?>
         cdate=now.format("%Y-%m-%dT%H:%M:%S.000000Z"),
         lmod=now.format("%a, %d %b %Y %H:%M:%S GMT"),
         uuid=uuid);
+    Ok(Response::builder().status(207)
+        .header("Content-Type", "text/xml; charset=\"utf-8\"")
+        .body(Full::new(Bytes::from(xml))).unwrap())
+}
+
+/// Check if the path is a repository root (for multi-repository listing)
+fn is_repository_root(path: &str) -> bool {
+    path == "/svn/" || path == "/svn" || path == "/" || path == ""
+}
+
+/// Handle PROPFIND request for repository root (list all repositories in multi-repo mode)
+async fn handle_repository_root_propfind() -> Result<Response<Full<Bytes>>, WebDavError> {
+    let registry = REPOSITORY_REGISTRY.get().ok_or_else(|| WebDavError::Internal("Repository registry not initialized".to_string()))?;
+    let repo_names = registry.list();
+
+    // Get display names from config if available
+    let repo_configs = MULTI_REPO_CONFIG.get();
+
+    let mut responses = String::new();
+
+    for repo_name in &repo_names {
+        let display_name = repo_configs
+            .and_then(|configs| configs.get(*repo_name))
+            .and_then(|config| config.display_name.as_ref())
+            .map(|s| s.as_str())
+            .unwrap_or(*repo_name);
+
+        let href = format!("{}/{}/", REPO_PREFIX, repo_name);
+
+        responses.push_str(&format!(
+            r#"  <D:response>
+    <D:href>{href}</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:displayname>{display_name}</D:displayname>
+        <D:resourcetype><D:collection/></D:resourcetype>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>"#,
+            href = escape_xml(&href),
+            display_name = escape_xml(display_name)
+        ));
+    }
+
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:" xmlns:S="http://subversion.tigris.org/xmlns/dav/">
+{responses}
+</D:multistatus>"#,
+        responses = responses
+    );
+
     Ok(Response::builder().status(207)
         .header("Content-Type", "text/xml; charset=\"utf-8\"")
         .body(Full::new(Bytes::from(xml))).unwrap())
@@ -432,8 +634,8 @@ async fn handle_svn_special_propfind(path: &str, current_rev: u64, uuid: &str) -
 // ==================== REPORT ====================
 
 pub async fn report_handler(req: Request<Incoming>, _config: &Config) -> Result<Response<Full<Bytes>>, WebDavError> {
-    let repo = get_repo();
     let path = req.uri().path().to_string();
+    let repo = get_repo_by_path(&path).map_err(|e| WebDavError::Internal(e))?;
     let body = match req.into_body().collect().await {
         Ok(c) => c.to_bytes(),
         Err(e) => return Ok(Response::builder().status(400).body(Full::new(Bytes::from(format!("Failed: {}", e)))).unwrap()),
@@ -482,7 +684,7 @@ pub async fn report_handler(req: Request<Incoming>, _config: &Config) -> Result<
 ///
 /// This is the primary report for `svn checkout` and `svn update`.
 /// It sends the full tree content to the client when `send-all="true"` is requested.
-async fn handle_update_report(body_str: &str, repo: &SqliteRepository) -> Result<String, WebDavError> {
+async fn handle_update_report(body_str: &str, repo: Arc<SqliteRepository>) -> Result<String, WebDavError> {
     let current_rev = repo.current_rev().await;
     let uuid = repo.uuid();
 
@@ -639,7 +841,7 @@ async fn handle_update_report(body_str: &str, repo: &SqliteRepository) -> Result
 /// - limit (max number of log entries)
 /// - discover-changed-paths (include changed file list per commit)
 /// - revprop filtering
-async fn handle_log_report(body_str: &str, repo: &SqliteRepository) -> Result<String, WebDavError> {
+async fn handle_log_report(body_str: &str, repo: Arc<SqliteRepository>) -> Result<String, WebDavError> {
     let current_rev = repo.current_rev().await;
     let (start_rev, end_rev, reverse) = parse_log_range(body_str, current_rev);
 
@@ -754,7 +956,7 @@ async fn handle_log_report(body_str: &str, repo: &SqliteRepository) -> Result<St
 ///
 /// Returns the path of a file/directory at different revisions.
 /// Used by `svn log --use-merge-history`, `svn blame`, etc.
-async fn handle_get_locations_report(body_str: &str, _request_path: &str, repo: &SqliteRepository) -> Result<String, WebDavError> {
+async fn handle_get_locations_report(body_str: &str, _request_path: &str, repo: Arc<SqliteRepository>) -> Result<String, WebDavError> {
     let current_rev = repo.current_rev().await;
 
     // Parse path from request
@@ -808,7 +1010,7 @@ async fn handle_get_locations_report(body_str: &str, _request_path: &str, repo: 
 ///
 /// Returns the revision number that was current at a given date/time.
 /// Used by `svn checkout -r {date}`, `svn log -r {date}:HEAD`, etc.
-async fn handle_dated_rev_report(body_str: &str, repo: &SqliteRepository) -> Result<String, WebDavError> {
+async fn handle_dated_rev_report(body_str: &str, repo: Arc<SqliteRepository>) -> Result<String, WebDavError> {
     let current_rev = repo.current_rev().await;
 
     // Parse the requested date
@@ -850,7 +1052,7 @@ async fn handle_dated_rev_report(body_str: &str, repo: &SqliteRepository) -> Res
 ///
 /// Returns merge tracking information. Since we don't have full merge tracking,
 /// we return an empty report.
-async fn handle_mergeinfo_report(_body_str: &str, _repo: &SqliteRepository) -> Result<String, WebDavError> {
+async fn handle_mergeinfo_report(_body_str: &str, _repo: Arc<SqliteRepository>) -> Result<String, WebDavError> {
     Ok("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
         <S:mergeinfo-report xmlns:S=\"svn:\">\n\
         </S:mergeinfo-report>".to_string())
@@ -869,7 +1071,7 @@ async fn handle_get_locks_report(_body_str: &str) -> Result<String, WebDavError>
 /// Handle replay-report
 ///
 /// Replays a revision's changes. Used for svnsync and similar tools.
-async fn handle_replay_report(body_str: &str, repo: &SqliteRepository) -> Result<String, WebDavError> {
+async fn handle_replay_report(body_str: &str, repo: Arc<SqliteRepository>) -> Result<String, WebDavError> {
     let current_rev = repo.current_rev().await;
 
     // Parse the revision to replay
@@ -913,7 +1115,7 @@ async fn handle_replay_report(body_str: &str, repo: &SqliteRepository) -> Result
 /// Handle get-deleted-rev-report
 ///
 /// Returns the revision in which a path was deleted.
-async fn handle_get_deleted_rev_report(body_str: &str, repo: &SqliteRepository) -> Result<String, WebDavError> {
+async fn handle_get_deleted_rev_report(body_str: &str, repo: Arc<SqliteRepository>) -> Result<String, WebDavError> {
     let current_rev = repo.current_rev().await;
 
     let query_path = extract_text_between(body_str, "<S:path>", "</S:path>")
@@ -958,7 +1160,7 @@ async fn handle_get_deleted_rev_report(body_str: &str, repo: &SqliteRepository) 
 /// Handle inherited-props-report
 ///
 /// Returns inherited properties for a path. Used by svn 1.8+ clients.
-async fn handle_inherited_props_report(body_str: &str, _request_path: &str, _repo: &SqliteRepository) -> Result<String, WebDavError> {
+async fn handle_inherited_props_report(body_str: &str, _request_path: &str, _repo: Arc<SqliteRepository>) -> Result<String, WebDavError> {
     let _query_path = extract_text_between(body_str, "<S:path>", "</S:path>")
         .unwrap_or("");
 
@@ -971,7 +1173,8 @@ async fn handle_inherited_props_report(body_str: &str, _request_path: &str, _rep
 // ==================== MERGE ====================
 
 pub async fn merge_handler(req: Request<Incoming>, _config: &Config) -> Result<Response<Full<Bytes>>, WebDavError> {
-    let repo = get_repo();
+    let path = req.uri().path().to_string();
+    let repo = get_repo_by_path(&path).map_err(|e| WebDavError::Internal(e))?;
     let body = match req.into_body().collect().await {
         Ok(c) => c.to_bytes(),
         Err(e) => return Ok(Response::builder().status(400).body(Full::new(Bytes::from(format!("Failed: {}", e)))).unwrap()),
@@ -1046,8 +1249,8 @@ pub async fn merge_handler(req: Request<Incoming>, _config: &Config) -> Result<R
 // ==================== GET ====================
 
 pub async fn get_handler(req: Request<Incoming>, _config: &Config) -> Result<Response<Full<Bytes>>, WebDavError> {
-    let repo = get_repo();
     let path = req.uri().path().to_string();
+    let repo = get_repo_by_path(&path).map_err(|e| WebDavError::Internal(e))?;
 
     // Handle GET /!svn/act/ — list all activities
     let special = path.strip_prefix(REPO_PREFIX).unwrap_or(&path);
@@ -1069,7 +1272,8 @@ pub async fn get_handler(req: Request<Incoming>, _config: &Config) -> Result<Res
 
 /// Handle GET /!svn/act/ — list all active activities (transactions)
 async fn handle_list_activities() -> Result<Response<Full<Bytes>>, WebDavError> {
-    let repo = get_repo();
+    // For activity listing, use default repo as activities are global
+    let repo = get_repo_by_path("/svn").map_err(|e| WebDavError::Internal(e))?;
     let uuid = repo.uuid().to_string();
     let txns = TRANSACTIONS.read().await;
 
@@ -1100,8 +1304,8 @@ async fn handle_list_activities() -> Result<Response<Full<Bytes>>, WebDavError> 
 // ==================== PROPPATCH ====================
 
 pub async fn proppatch_handler(req: Request<Incoming>, _config: &Config) -> Result<Response<Full<Bytes>>, WebDavError> {
-    let repo = get_repo();
     let path = req.uri().path().to_string();
+    let repo = get_repo_by_path(&path).map_err(|e| WebDavError::Internal(e))?;
     let body = match req.collect().await {
         Ok(c) => c.to_bytes(),
         Err(e) => return Ok(Response::builder().status(400).body(Full::new(Bytes::from(format!("Failed: {}", e)))).unwrap()),
@@ -1222,13 +1426,13 @@ pub async fn put_handler(req: Request<Incoming>, _config: &Config) -> Result<Res
 // ==================== HEAD ====================
 
 pub async fn head_handler(req: Request<Incoming>, _config: &Config) -> Result<Response<Full<Bytes>>, WebDavError> {
-    let repo = get_repo();
-    let path = req.uri().path();
+    let path = req.uri().path().to_string();
+    let repo = get_repo_by_path(&path).map_err(|e| WebDavError::Internal(e))?;
     tracing::info!("HEAD {}", path);
     if path.contains("!svn") {
         return Ok(Response::builder().status(404).body(Full::new(Bytes::new())).unwrap());
     }
-    let exists = repo.exists(path, repo.current_rev().await).await.unwrap_or(false);
+    let exists = repo.exists(&path, repo.current_rev().await).await.unwrap_or(false);
     if exists {
         Ok(Response::builder().status(200)
             .header("Content-Type", "application/octet-stream")
@@ -1322,9 +1526,130 @@ async fn handle_delete_activity(txn_name: &str) -> Result<Response<Full<Bytes>>,
 pub async fn checkout_handler(_req: Request<Incoming>, _config: &Config) -> Result<Response<Full<Bytes>>, WebDavError> {
     Ok(Response::builder().status(200).body(Full::new(Bytes::new())).unwrap())
 }
+
+// ==================== Tests ====================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+    use std::sync::Mutex;
+
+    // Test state that can be set/reset
+    static TEST_REGISTRY: Mutex<Option<RepositoryRegistry>> = Mutex::new(None);
+
+    /// Test single-repo mode routing (legacy mode)
+    #[test]
+    fn test_get_repo_by_path_single_repo() {
+        let tmp = tempdir().unwrap();
+        let repo_path = tmp.path().join("test_repo");
+
+        // Initialize a repository
+        let repo = SqliteRepository::open(&repo_path).unwrap();
+        SQLITE_REPO.set(Arc::new(repo)).unwrap_or(());
+
+        // Test that path routing works in single-repo mode
+        let result = get_repo_by_path("/svn/test.txt");
+        assert!(result.is_ok());
+
+        let repo_arc = result.unwrap();
+        assert_eq!(repo_arc.root(), repo_path);
+    }
+
+    /// Test multi-repo mode routing
+    #[tokio::test]
+    async fn test_get_repo_by_path_multi_repo() {
+        let tmp = tempdir().unwrap();
+
+        // Create two repositories
+        let repo1_path = tmp.path().join("repo1");
+        let repo2_path = tmp.path().join("repo2");
+
+        let repo1 = SqliteRepository::open(&repo1_path).unwrap();
+        let repo2 = SqliteRepository::open(&repo2_path).unwrap();
+
+        // Initialize them
+        repo1.initialize().await.unwrap();
+        repo2.initialize().await.unwrap();
+
+        // Create a registry and register repositories
+        let mut registry = RepositoryRegistry::new();
+        registry.register("repo1", Arc::new(repo1)).unwrap();
+        registry.register("repo2", Arc::new(repo2)).unwrap();
+
+        REPOSITORY_REGISTRY.set(registry).unwrap_or(());
+
+        // Test routing to repo1
+        let result = get_repo_by_path("/svn/repo1/test.txt");
+        assert!(result.is_ok());
+        let repo_arc = result.unwrap();
+        assert_eq!(repo_arc.root(), repo1_path);
+
+        // Test routing to repo2
+        let result = get_repo_by_path("/svn/repo2/test.txt");
+        assert!(result.is_ok());
+        let repo_arc = result.unwrap();
+        assert_eq!(repo_arc.root(), repo2_path);
+
+        // Test that non-existent repo names fall back to default
+        let result = get_repo_by_path("/svn/nonexistent/test.txt");
+        assert!(result.is_ok());
+    }
+
+    /// Test repository registry functionality
+    #[test]
+    fn test_repository_registry() {
+        let tmp = tempdir().unwrap();
+        let repo_path = tmp.path().join("test_repo");
+        let repo = SqliteRepository::open(&repo_path).unwrap();
+
+        let mut registry = RepositoryRegistry::new();
+
+        // Test registering a repository
+        let result = registry.register("test-repo", Arc::new(repo));
+        assert!(result.is_ok());
+
+        // Test duplicate registration fails - open repo again for duplicate test
+        let repo_dup = SqliteRepository::open(&repo_path).unwrap();
+        let result = registry.register("test-repo", Arc::new(repo_dup));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("already registered"));
+
+        // Test getting repository by name
+        let tmp2 = tempdir().unwrap();
+        let repo2_path = tmp2.path().join("test_repo2");
+        let repo2 = SqliteRepository::open(&repo2_path).unwrap();
+        registry.register("test-repo2", Arc::new(repo2)).unwrap();
+
+        let retrieved = registry.get("test-repo");
+        assert!(retrieved.is_some());
+
+        // Test listing repositories
+        let repos = registry.list();
+        assert_eq!(repos.len(), 2);
+        assert!(repos.contains(&"test-repo"));
+        assert!(repos.contains(&"test-repo2"));
+
+        // Test is_multi_repo
+        let mut single_registry = RepositoryRegistry::new();
+        let tmp3 = tempdir().unwrap();
+        let repo3_path = tmp3.path().join("test_repo3");
+        let repo3 = SqliteRepository::open(&repo3_path).unwrap();
+        single_registry.register("single-repo", Arc::new(repo3)).unwrap();
+
+        assert!(!single_registry.is_multi_repo()); // Single repo
+        assert!(registry.is_multi_repo()); // Multiple repos
+
+        // Test get_default
+        let default = single_registry.get_default();
+        assert!(default.is_some());
+        assert_eq!(default.unwrap().root(), repo3_path);
+    }
+}
+
 pub async fn mkactivity_handler(req: Request<Incoming>, _config: &Config) -> Result<Response<Full<Bytes>>, WebDavError> {
-    let repo = get_repo();
     let path = req.uri().path().to_string();
+    let repo = get_repo_by_path(&path).map_err(|e| WebDavError::Internal(e))?;
     let _ = req.into_body().collect().await;
 
     tracing::info!("MKACTIVITY {}", path);
