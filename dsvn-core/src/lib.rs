@@ -21,6 +21,8 @@ pub mod packfile;
 pub mod properties;
 pub mod sync;
 pub mod replication;
+pub mod auth;
+pub mod authz;
 
 #[cfg(test)]
 mod persistent_tests;
@@ -37,3 +39,5 @@ pub use replication::{
     RevisionData, SyncAck, SyncComplete, Compression, RepositoryInfo,
     PROTOCOL_VERSION, PROTOCOL_MAGIC,
 };
+pub use auth::{AuthProvider, AuthResult, HtpasswdAuthProvider, NoOpAuthProvider, MockAuthProvider};
+pub use authz::{AuthzProvider, AuthzResult, AccessLevel, SvnAuthzProvider, NoOpAuthzProvider, DenyAllAuthzProvider, MockAuthzProvider};

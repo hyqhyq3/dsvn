@@ -168,7 +168,7 @@ dsvn/
 - [x] Full WebDAV method implementation (OPTIONS, GET, PUT, DELETE, HEAD, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE)
 - [x] SVN-specific operations (REPORT, MKACTIVITY, MERGE, CHECKOUT)
 - [x] Transaction management
-- [ ] Authentication/authorization
+- [x] Authentication/authorization (htpasswd + SVN authz)
 
 ### Phase 3: Repository Operations ✅
 - [x] Checkout/update workflows
@@ -234,6 +234,70 @@ litmus http://localhost:8080/svn
 - `--key-file`: TLS private key file
 - `--max-connections`: Maximum concurrent connections (default: 1000)
 - `--debug`: Enable debug logging
+
+### Authentication and Authorization
+
+DSvn supports pluggable authentication and authorization providers.
+
+#### Authentication Providers
+
+Currently supported:
+- **Htpasswd**: Apache-style htpasswd file authentication
+- **NoOp**: No authentication (for testing)
+- **Mock**: Mock authentication for testing
+
+Example htpasswd file (`examples/htpasswd.example`):
+```text
+admin:$2y$05$rGZz6f3q9W5v7xY8zM2mLe8wW0k9vY6gQ4hMxLkNnMzKqPpJrWQ6e
+developer:$2y$05$rGZz6f3q9W5v7xY8zM2mLe8wW0k9vY6gQ4hMxLkNnMzKqPpJrWQ6e
+```
+
+Supported hash formats:
+- bcrypt (`$2y$`, `$2b$`, `$2a$`) - **Recommended**
+- SHA1 (`{SHA}...`) - Basic support
+- crypt - Deprecated, not recommended
+
+#### Authorization Providers
+
+Currently supported:
+- **SvnAuthz**: Apache Subversion-style authz.conf files
+- **NoOp**: No authorization (allow all)
+- **DenyAll**: Deny all requests (safe default)
+- **Mock**: Mock authorization for testing
+
+Example authz file (`examples/authz.example`):
+```text
+[groups]
+developers = alice, bob
+admins = charlie
+
+[/]
+* = r
+@admins = rw
+
+[/private]
+@admins = rw
+* =
+```
+
+File format:
+- `[groups]`: Define user groups
+- `[path]`: Path-specific rules
+- `user_or_group = r|rw|`: Access rules
+- `*`: Anonymous users
+- `@group`: Group reference
+
+#### Configuration Example
+
+```bash
+# Start server with authentication and authorization
+dsvn start \
+  --repo-root /path/to/repo \
+  --auth-provider htpasswd \
+  --auth-file /path/to/htpasswd \
+  --authz-provider svn \
+  --authz-file /path/to/authz.conf
+```
 
 ## Performance Targets
 

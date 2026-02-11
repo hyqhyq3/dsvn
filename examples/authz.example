@@ -1,0 +1,123 @@
+# Example authz file for DSvn authorization
+#
+# This file follows Apache Subversion authz.conf format
+# See: https://svnbook.red-bean.com/en/1.7/svn.serverconfig.pathbasedauthz.html
+#
+# Format:
+# [groups]
+# group_name = user1, user2, user3
+#
+# [repository_path]
+# user_or_group = r|rw| (empty for no access)
+#
+# Special characters:
+# * = anonymous users (no authentication)
+# @group_name = group reference
+
+[groups]
+# Define user groups
+developers = alice, bob, charlie
+admins = admin, dave
+readers = eve, frank
+
+# Repository root access rules
+[/]
+# Anonymous users can read (no authentication required)
+* = r
+
+# Admins have full access
+@admins = rw
+
+# Developers can read/write
+@developers = rw
+
+# Readers can only read
+@readers = r
+
+# Specific user rules (overrides group rules)
+alice = rw  # Alice has full access
+bob = r     # Bob can only read (overrides developers group)
+
+# Private directory rules
+[/private]
+# Only admins can access private directory
+@admins = rw
+* =        # Deny all others (empty means no access)
+
+# Source code directory
+[/trunk/src]
+# Developers can read/write source code
+@developers = rw
+
+# Everyone else can read
+* = r
+
+# Documentation directory
+[/trunk/docs]
+# Everyone can read documentation
+* = r
+
+# Only admins can write documentation
+@admins = rw
+
+# Branch-specific rules
+[/branches/experimental]
+# Only specific developers can access experimental branches
+alice = rw
+bob = rw
+* =        # Deny all others
+
+# Tag directory (read-only for all)
+[/tags]
+* = r
+@admins = rw  # Only admins can create tags
+
+# User-specific directories
+[/users/alice]
+alice = rw
+* = r         # Others can read
+
+[/users/bob]
+bob = rw
+* = r
+
+# Path with wildcard (not standard SVN, but DSvn supports)
+[/trunk/src/*/tests]
+# Everyone can read tests
+* = r
+
+# Only developers can write tests
+@developers = rw
+
+# Complex path example
+[/trunk/src/project/module]
+# Module maintainers have full access
+charlie = rw
+dave = rw
+
+# Others can read
+* = r
+
+# Deny access to sensitive files
+[/trunk/src/config/secrets]
+# Only admins can access secrets
+@admins = rw
+* =        # Deny all others
+
+# Example for multiple repositories (when using multi-repo mode)
+[repo1:/]
+* = r
+@admins = rw
+
+[repo2:/]
+@developers = rw
+* = r
+
+# Notes:
+# 1. Rules are evaluated from most specific to least specific path
+# 2. User-specific rules override group rules
+# 3. Later rules for the same path/user override earlier ones
+# 4. Empty access string ("") means no access
+# 5. Use "r" for read-only access
+# 6. Use "rw" for read-write access
+# 7. Group names must be defined in [groups] section

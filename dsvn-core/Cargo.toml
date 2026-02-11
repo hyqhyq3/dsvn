@@ -19,7 +19,12 @@ zstd-safe = { workspace = true }
 
 # Cryptography
 sha2 = { workspace = true }
+sha1 = "0.10"
 hex = { workspace = true }
+base64 = "0.22"
+
+# Authentication (optional)
+bcrypt = { version = "0.16", optional = true }
 
 # Storage
 fjall = { workspace = true }
@@ -48,3 +53,7 @@ lru = "0.12"
 criterion = "0.5"
 proptest = "1.5"
 tempfile = "3.13"
+
+[features]
+default = ["bcrypt-auth"]
+bcrypt-auth = ["bcrypt"]
